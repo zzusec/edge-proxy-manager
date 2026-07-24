@@ -1,0 +1,15 @@
+name = "edge-proxy-manager"
+main = "worker.js"
+compatibility_date = "2026-07-24"
+workers_dev = true
+
+[[routes]]
+pattern = "npm.example.com"
+custom_domain = true
+
+[vars]
+ADMIN_HOSTNAME = "npm.example.com"
+
+[[kv_namespaces]]
+binding = "PROXY_CONFIG"
+id = "YOUR_KV_NAMESPACE_ID"

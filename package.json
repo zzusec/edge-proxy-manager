@@ -1,0 +1,16 @@
+{
+  "name": "edge-proxy-manager",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Lightweight Nginx Proxy Manager alternative on Cloudflare Workers",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.114.0"
+  }
+}

@@ -1,0 +1,23 @@
+name = "edge-proxy-manager"
+main = "worker.js"
+compatibility_date = "2026-07-24"
+workers_dev = true
+
+# Bind your admin hostname and proxy domains after deploy.
+# Example custom domains:
+# [[routes]]
+# pattern = "npm.example.com"
+# custom_domain = true
+#
+# [[routes]]
+# pattern = "api.example.com"
+# custom_domain = true
+
+[vars]
+ADMIN_HOSTNAME = "npm.example.com"
+
+# Create a KV namespace, then put its id here:
+#   npx wrangler kv namespace create PROXY_CONFIG
+[[kv_namespaces]]
+binding = "PROXY_CONFIG"
+id = "YOUR_KV_NAMESPACE_ID"
