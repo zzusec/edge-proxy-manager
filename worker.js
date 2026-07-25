@@ -1,4 +1,6 @@
 const PROXY_KEY_PREFIX = "proxy:";
+const CF_SETTINGS_KEY = "settings:cloudflare";
+const ADMIN_SETTINGS_KEY = "settings:admin";
 const SESSION_COOKIE = "__Host-edge_proxy_session";
 const SESSION_MAX_AGE = 8 * 60 * 60;
 
@@ -45,10 +47,12 @@ async function handleAdminRequest(request, env, url) {
 
     const username = String(form.get("username") || "");
     const password = String(form.get("password") || "");
-    const [usernameMatches, passwordMatches] = await Promise.all([
-      secureEqual(username, env.ADMIN_USERNAME, env.SESSION_SECRET),
-      secureEqual(password, env.ADMIN_PASSWORD, env.SESSION_SECRET),
-    ]);
+    const usernameMatches = await secureEqual(
+      username,
+      env.ADMIN_USERNAME,
+      env.SESSION_SECRET,
+    );
+    const passwordMatches = await verifyAdminPassword(env, password);
 
     if (!usernameMatches || !passwordMatches) {
       return htmlResponse(loginPage("用户名或密码错误"), 401);
@@ -100,6 +104,14 @@ async function handleAdminRequest(request, env, url) {
       return jsonResponse({ error: "Forbidden" }, 403);
     }
 
+    const cfSettings = await getCloudflareSettings(env.PROXY_CONFIG);
+    if (!cfSettings?.apiToken) {
+      return jsonResponse(
+        { error: "请先绑定 Cloudflare API 令牌" },
+        403,
+      );
+    }
+
     let input;
 
     try {
@@ -112,6 +124,30 @@ async function handleAdminRequest(request, env, url) {
 
     if (validation.error) {
       return jsonResponse({ error: validation.error }, 400);
+    }
+
+    try {
+      const zones = await listCloudflareZones(cfSettings.apiToken);
+      const domain = validation.config.domain;
+      const matchedZone = findZoneForHostname(domain, zones);
+      if (!matchedZone) {
+        return jsonResponse(
+          {
+            error:
+              "域名未在当前 Cloudflare 账号托管",
+          },
+          400,
+        );
+      }
+    } catch (error) {
+      return jsonResponse(
+        {
+          error:
+            "域名校验失败：" +
+            (error instanceof Error ? error.message : "请重新绑定 API 令牌"),
+        },
+        502,
+      );
     }
 
     const originalDomain = normalizeHostname(input.originalDomain);
@@ -154,6 +190,327 @@ async function handleAdminRequest(request, env, url) {
 
     await env.PROXY_CONFIG.delete(`${PROXY_KEY_PREFIX}${domain}`);
     return jsonResponse({ deleted: domain });
+  }
+
+  if (url.pathname === "/api/settings/cloudflare" && request.method === "GET") {
+    const settings = await getCloudflareSettings(env.PROXY_CONFIG);
+    return jsonResponse({
+      configured: Boolean(settings?.apiToken),
+      accountName: settings?.accountName || "",
+      verifiedAt: settings?.verifiedAt || "",
+      zoneCount: settings?.zoneCount ?? null,
+    });
+  }
+
+  if (url.pathname === "/api/settings/cloudflare" && request.method === "POST") {
+    if (!isSameOriginRequest(request, url)) {
+      return jsonResponse({ error: "Forbidden" }, 403);
+    }
+
+    let input;
+    try {
+      input = await request.json();
+    } catch {
+      return jsonResponse({ error: "请求数据不是有效 JSON" }, 400);
+    }
+
+    const apiToken = String(input.apiToken || "").trim();
+    if (!apiToken || apiToken.length < 20) {
+      return jsonResponse({ error: "请填写有效的 Cloudflare API Token" }, 400);
+    }
+
+    try {
+      const verified = await verifyCloudflareToken(apiToken);
+      const zones = await listCloudflareZones(apiToken);
+      const settings = {
+        apiToken,
+        accountName: verified.accountName || "",
+        verifiedAt: new Date().toISOString(),
+        zoneCount: zones.length,
+      };
+      await env.PROXY_CONFIG.put(CF_SETTINGS_KEY, JSON.stringify(settings));
+      return jsonResponse({
+        configured: true,
+        accountName: settings.accountName,
+        verifiedAt: settings.verifiedAt,
+        zoneCount: settings.zoneCount,
+        zones: zones.map((z) => ({
+          id: z.id,
+          name: z.name,
+          status: z.status,
+        })),
+      });
+    } catch (error) {
+      return jsonResponse(
+        { error: error instanceof Error ? error.message : "Cloudflare API 验证失败" },
+        400,
+      );
+    }
+  }
+
+  if (url.pathname === "/api/settings/cloudflare" && request.method === "DELETE") {
+    if (!isSameOriginRequest(request, url)) {
+      return jsonResponse({ error: "Forbidden" }, 403);
+    }
+    await env.PROXY_CONFIG.delete(CF_SETTINGS_KEY);
+    return jsonResponse({ configured: false });
+  }
+
+  if (url.pathname === "/api/account/password" && request.method === "POST") {
+    if (!isSameOriginRequest(request, url)) {
+      return jsonResponse({ error: "Forbidden" }, 403);
+    }
+
+    let input;
+    try {
+      input = await request.json();
+    } catch {
+      return jsonResponse({ error: "请求数据不是有效 JSON" }, 400);
+    }
+
+    const currentPassword = String(input.currentPassword || "");
+    const newPassword = String(input.newPassword || "");
+    const confirmPassword = String(input.confirmPassword || "");
+
+    if (!(await verifyAdminPassword(env, currentPassword))) {
+      return jsonResponse({ error: "当前密码不正确" }, 400);
+    }
+    if (newPassword.length < 8) {
+      return jsonResponse({ error: "新密码至少 8 位" }, 400);
+    }
+    if (newPassword !== confirmPassword) {
+      return jsonResponse({ error: "两次输入的新密码不一致" }, 400);
+    }
+    if (newPassword === currentPassword) {
+      return jsonResponse({ error: "新密码不能与当前密码相同" }, 400);
+    }
+
+    const passwordHash = await hashAdminPassword(newPassword, env.SESSION_SECRET);
+    await env.PROXY_CONFIG.put(
+      ADMIN_SETTINGS_KEY,
+      JSON.stringify({
+        passwordHash,
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+
+    return jsonResponse({ ok: true, updatedAt: new Date().toISOString() });
+  }
+
+  if (url.pathname === "/api/certificates" && request.method === "GET") {
+    const proxies = await listProxyConfigs(env.PROXY_CONFIG);
+    const settings = await getCloudflareSettings(env.PROXY_CONFIG);
+    if (!settings?.apiToken) {
+      return jsonResponse({
+        configured: false,
+        certificates: proxies.map((proxy) => ({
+          domain: proxy.domain,
+          enabled: proxy.enabled !== false,
+          origin: createTargetOrigin(proxy.scheme, proxy.targetHost, proxy.targetPort),
+          forceHttps: Boolean(proxy.forceHttps),
+          hsts: Boolean(proxy.hsts),
+          zone: null,
+          status: "unknown",
+          statusText: "未绑定 Cloudflare API",
+          sslMode: null,
+          hosts: [],
+        })),
+      });
+    }
+
+    try {
+      const zones = await listCloudflareZones(settings.apiToken);
+      const zoneSslCache = new Map();
+      const certificates = [];
+
+      for (const proxy of proxies) {
+        const zone = findZoneForHostname(proxy.domain, zones);
+        let sslMode = null;
+        let packs = [];
+        let status = "pending";
+        let statusText = "待确认";
+
+        if (!zone) {
+          status = "unmanaged";
+          statusText = "域名未托管";
+        } else {
+          if (!zoneSslCache.has(zone.id)) {
+            try {
+              const [mode, certPacks] = await Promise.all([
+                getZoneSslMode(settings.apiToken, zone.id),
+                listZoneCertificatePacks(settings.apiToken, zone.id),
+              ]);
+              zoneSslCache.set(zone.id, { mode, packs: certPacks });
+            } catch (error) {
+              zoneSslCache.set(zone.id, {
+                mode: null,
+                packs: [],
+                error: error instanceof Error ? error.message : "SSL 查询失败",
+              });
+            }
+          }
+          const cached = zoneSslCache.get(zone.id) || {};
+          sslMode = cached.mode || null;
+          packs = cached.packs || [];
+          const match = packs.find((pack) =>
+            (pack.hosts || []).some(
+              (host) =>
+                host === proxy.domain ||
+                host === "*." + zone.name ||
+                (host.startsWith("*.") &&
+                  (proxy.domain === host.slice(2) ||
+                    proxy.domain.endsWith("." + host.slice(2)))),
+            ),
+          );
+          if (match) {
+            const packStatus = String(match.status || "").toLowerCase();
+            if (["active", "issuing", "pending_validation", "pending_issuance", "pending_deployment"].includes(packStatus)) {
+              status = packStatus === "active" ? "active" : "pending";
+              statusText =
+                packStatus === "active"
+                  ? "已生效"
+                  : packStatus === "issuing" || packStatus.includes("pending")
+                    ? "签发中"
+                    : packStatus;
+            } else if (packStatus) {
+              status = "warning";
+              statusText = packStatus;
+            } else {
+              status = "active";
+              statusText = "Universal SSL";
+            }
+            certificates.push({
+              domain: proxy.domain,
+              enabled: proxy.enabled !== false,
+              origin: createTargetOrigin(proxy.scheme, proxy.targetHost, proxy.targetPort),
+              forceHttps: Boolean(proxy.forceHttps),
+              hsts: Boolean(proxy.hsts),
+              zone: zone.name,
+              status,
+              statusText,
+              sslMode,
+              hosts: match.hosts || [proxy.domain],
+              expiresOn: match.expires_on || match.certificate_authority_expires_on || null,
+              type: match.type || "universal",
+            });
+            continue;
+          }
+
+          // No matching pack found - still CF hosted edge cert usually works for proxied hostnames
+          if (cached.error) {
+            status = "limited";
+            statusText = "需 SSL 读权限";
+          } else {
+            status = "active";
+            statusText = "边缘证书托管";
+          }
+        }
+
+        certificates.push({
+          domain: proxy.domain,
+          enabled: proxy.enabled !== false,
+          origin: createTargetOrigin(proxy.scheme, proxy.targetHost, proxy.targetPort),
+          forceHttps: Boolean(proxy.forceHttps),
+          hsts: Boolean(proxy.hsts),
+          zone: zone?.name || null,
+          status,
+          statusText,
+          sslMode,
+          hosts: proxy.domain ? [proxy.domain] : [],
+          expiresOn: null,
+          type: zone ? "universal" : null,
+        });
+      }
+
+      return jsonResponse({
+        configured: true,
+        accountName: settings.accountName || "",
+        certificates,
+      });
+    } catch (error) {
+      return jsonResponse(
+        {
+          configured: true,
+          error: error instanceof Error ? error.message : "证书状态获取失败",
+          certificates: proxies.map((proxy) => ({
+            domain: proxy.domain,
+            enabled: proxy.enabled !== false,
+            origin: createTargetOrigin(proxy.scheme, proxy.targetHost, proxy.targetPort),
+            forceHttps: Boolean(proxy.forceHttps),
+            hsts: Boolean(proxy.hsts),
+            zone: null,
+            status: "error",
+            statusText: "查询失败",
+            sslMode: null,
+            hosts: [],
+          })),
+        },
+        200,
+      );
+    }
+  }
+
+  if (url.pathname === "/api/cloudflare/zones" && request.method === "GET") {
+    const settings = await getCloudflareSettings(env.PROXY_CONFIG);
+    if (!settings?.apiToken) {
+      return jsonResponse(
+        { error: "未绑定 Cloudflare API", configured: false, zones: [] },
+        400,
+      );
+    }
+
+    try {
+      const zones = await listCloudflareZones(settings.apiToken);
+      // refresh cache metadata
+      settings.zoneCount = zones.length;
+      settings.verifiedAt = new Date().toISOString();
+      await env.PROXY_CONFIG.put(CF_SETTINGS_KEY, JSON.stringify(settings));
+      return jsonResponse({
+        configured: true,
+        accountName: settings.accountName || "",
+        zones: zones.map((z) => ({
+          id: z.id,
+          name: z.name,
+          status: z.status,
+          plan: z.plan || "",
+        })),
+      });
+    } catch (error) {
+      return jsonResponse(
+        { error: error instanceof Error ? error.message : "拉取域名失败" },
+        502,
+      );
+    }
+  }
+
+  if (url.pathname.startsWith("/api/cloudflare/zones/") && url.pathname.endsWith("/dns") && request.method === "GET") {
+    const settings = await getCloudflareSettings(env.PROXY_CONFIG);
+    if (!settings?.apiToken) {
+      return jsonResponse({ error: "未绑定 Cloudflare API", records: [] }, 400);
+    }
+    const zoneId = decodeURIComponent(
+      url.pathname.slice("/api/cloudflare/zones/".length, -"/dns".length),
+    );
+    if (!zoneId) {
+      return jsonResponse({ error: "zone id 无效" }, 400);
+    }
+    try {
+      const records = await listCloudflareDnsRecords(settings.apiToken, zoneId);
+      return jsonResponse({
+        records: records.map((r) => ({
+          id: r.id,
+          type: r.type,
+          name: r.name,
+          content: r.content,
+          proxied: r.proxied,
+        })),
+      });
+    } catch (error) {
+      return jsonResponse(
+        { error: error instanceof Error ? error.message : "拉取 DNS 记录失败" },
+        502,
+      );
+    }
   }
 
   return new Response("Not Found", { status: 404 });
@@ -314,6 +671,206 @@ function getAdminConfigError(env) {
   }
 
   return missing.length ? `缺少配置：${missing.join("、")}` : "";
+}
+
+
+
+function findZoneForHostname(hostname, zones) {
+  const host = normalizeHostname(hostname);
+  if (!host || !Array.isArray(zones) || !zones.length) return null;
+
+  let best = null;
+  for (const zone of zones) {
+    const zoneName = normalizeHostname(zone?.name || zone);
+    if (!zoneName) continue;
+    if (host === zoneName || host.endsWith("." + zoneName)) {
+      if (!best || zoneName.length > normalizeHostname(best.name || best).length) {
+        best = typeof zone === "string" ? { name: zoneName } : { ...zone, name: zoneName };
+      }
+    }
+  }
+  return best;
+}
+
+
+async function getAdminSettings(kv) {
+  if (!kv?.get) return null;
+  return (await kv.get(ADMIN_SETTINGS_KEY, "json")) || null;
+}
+
+async function hashAdminPassword(password, secret) {
+  const key = await importHmacKey(secret);
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(String(password)),
+  );
+  return toBase64Url(new Uint8Array(signature));
+}
+
+async function verifyAdminPassword(env, password) {
+  const override = await getAdminSettings(env.PROXY_CONFIG);
+  if (override?.passwordHash) {
+    const actualHash = await hashAdminPassword(password, env.SESSION_SECRET);
+    return secureStringEqual(actualHash, String(override.passwordHash));
+  }
+  return secureEqual(password, env.ADMIN_PASSWORD, env.SESSION_SECRET);
+}
+
+function secureStringEqual(a, b) {
+  const left = String(a);
+  const right = String(b);
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+async function getCloudflareSettings(kv) {
+  if (!kv?.get) return null;
+  return (await kv.get(CF_SETTINGS_KEY, "json")) || null;
+}
+
+async function cloudflareApi(apiToken, path) {
+  const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`Cloudflare API 返回异常 (${response.status})`);
+  }
+
+  if (!response.ok || payload?.success === false) {
+    const msg =
+      payload?.errors?.[0]?.message ||
+      payload?.messages?.[0] ||
+      `Cloudflare API 错误 (${response.status})`;
+    throw new Error(msg);
+  }
+
+  return payload;
+}
+
+async function verifyCloudflareToken(apiToken) {
+  const payload = await cloudflareApi(apiToken, "/user/tokens/verify");
+  const status = payload?.result?.status;
+  if (status && status !== "active") {
+    throw new Error(`Token 状态不可用：${status}`);
+  }
+
+  let accountName = "";
+  try {
+    const user = await cloudflareApi(apiToken, "/user");
+    accountName = user?.result?.email || user?.result?.username || "";
+  } catch {
+    // token may be account-owned without /user scope
+    try {
+      const accounts = await cloudflareApi(apiToken, "/accounts?per_page=1");
+      accountName = accounts?.result?.[0]?.name || "";
+    } catch {
+      accountName = "";
+    }
+  }
+
+  return { accountName, status: status || "active" };
+}
+
+async function listCloudflareZones(apiToken) {
+  const zones = [];
+  let page = 1;
+
+  while (page <= 20) {
+    const payload = await cloudflareApi(
+      apiToken,
+      `/zones?page=${page}&per_page=50&status=active`,
+    );
+    const batch = payload?.result || [];
+    for (const zone of batch) {
+      zones.push({
+        id: zone.id,
+        name: normalizeHostname(zone.name),
+        status: zone.status || "",
+        plan: zone.plan?.name || "",
+      });
+    }
+    const info = payload?.result_info;
+    if (!info || page >= (info.total_pages || 1) || batch.length === 0) break;
+    page += 1;
+  }
+
+  zones.sort((a, b) => a.name.localeCompare(b.name));
+  return zones;
+}
+
+
+async function getZoneSslMode(apiToken, zoneId) {
+  try {
+    const payload = await cloudflareApi(
+      apiToken,
+      `/zones/${encodeURIComponent(zoneId)}/settings/ssl`,
+    );
+    return payload?.result?.value || null;
+  } catch {
+    return null;
+  }
+}
+
+async function listZoneCertificatePacks(apiToken, zoneId) {
+  try {
+    const payload = await cloudflareApi(
+      apiToken,
+      `/zones/${encodeURIComponent(zoneId)}/ssl/certificate_packs?status=all`,
+    );
+    const packs = payload?.result || [];
+    return packs.map((pack) => ({
+      id: pack.id,
+      type: pack.type,
+      status: pack.status,
+      hosts: pack.hosts || [],
+      expires_on: pack.expires_on || null,
+      certificate_authority_expires_on: pack.certificate_authority?.expires_on || null,
+    }));
+  } catch {
+    // Token may lack SSL read permission; fail soft.
+    return [];
+  }
+}
+
+async function listCloudflareDnsRecords(apiToken, zoneId) {
+  const records = [];
+  let page = 1;
+
+  while (page <= 20) {
+    const payload = await cloudflareApi(
+      apiToken,
+      `/zones/${encodeURIComponent(zoneId)}/dns_records?page=${page}&per_page=100`,
+    );
+    const batch = payload?.result || [];
+    for (const record of batch) {
+      if (!["A", "AAAA", "CNAME"].includes(record.type)) continue;
+      records.push({
+        id: record.id,
+        type: record.type,
+        name: normalizeHostname(record.name),
+        content: record.content,
+        proxied: Boolean(record.proxied),
+      });
+    }
+    const info = payload?.result_info;
+    if (!info || page >= (info.total_pages || 1) || batch.length === 0) break;
+    page += 1;
+  }
+
+  records.sort((a, b) => a.name.localeCompare(b.name));
+  return records;
 }
 
 async function listProxyConfigs(kv) {
@@ -726,7 +1283,7 @@ function loginPage(error = "") {
 </head>
 <body>
   <main class="card">
-    <div class="brand"><div class="logo">EP</div><div><h1>Edge Proxy Manager</h1><p>Cloudflare Worker 反向代理</p></div></div>
+    <div class="brand"><div class="logo">EP</div><div><h1>Edge Proxy Manager</h1><p>边缘反向代理</p></div></div>
     ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
     <form method="post" action="/login">
       <label for="username">用户名</label>
@@ -756,11 +1313,46 @@ function dashboardPage(username) {
     :root{color-scheme:light;--bg:#f5f7fb;--surface:#fff;--surface-soft:#f8fafc;--surface-hover:#f2f5f8;--text:#273247;--muted:#7c8799;--border:#e1e6ed;--shadow:0 1px 3px rgba(33,43,54,.06);--green:#6cbe08;--green-dark:#58a000;--green-soft:#eff9df;--orange:#f59f00;--blue:#1971c2;--pink:#d92d6b;--red:#d63939;--header-height:56px;--nav-height:48px;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
     :root[data-theme="dark"]{color-scheme:dark;--bg:#151922;--surface:#1d2330;--surface-soft:#242b39;--surface-hover:#2a3242;--text:#eef2f7;--muted:#9ba6b6;--border:#313a4a;--shadow:0 12px 32px rgba(0,0,0,.24);--green-soft:#26351c}
     *{box-sizing:border-box}html{scroll-behavior:smooth}body{min-height:100vh;margin:0;background:var(--bg);color:var(--text);display:flex;flex-direction:column}button,input,select,textarea{font:inherit}button{color:inherit}[hidden]{display:none!important}.icon{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-    .app-header{height:var(--header-height);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0;position:relative;z-index:40}.app-header-inner{height:100%;width:100%;max-width:1140px;padding:0 18px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:10px;color:var(--text);text-decoration:none;font-size:16px;font-weight:720;letter-spacing:-.01em}.brand-logo{width:30px;height:30px;display:grid;place-items:center;clip-path:polygon(50% 0,92% 24%,92% 76%,50% 100%,8% 76%,8% 24%);background:conic-gradient(from 25deg,#ff8b00,#f13576,#7657df,#1971c2,#ff8b00);padding:3px;filter:drop-shadow(0 3px 6px rgba(90,68,181,.14))}.brand-logo span{width:100%;height:100%;display:grid;place-items:center;clip-path:inherit;background:var(--surface);color:#6f56d9;font-size:11px;font-weight:900}.header-actions{display:flex;align-items:center;gap:10px}.language{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}.icon-button{width:40px;height:40px;border:0;border-radius:9px;background:transparent;display:grid;place-items:center;cursor:pointer;color:var(--text)}.icon-button:hover{background:var(--surface-hover)}.sun-icon{display:none}:root[data-theme="dark"] .moon-icon{display:none}:root[data-theme="dark"] .sun-icon{display:block}.account-menu{position:relative}.account-menu summary{list-style:none;display:flex;align-items:center;gap:10px;padding:5px 7px;border-radius:10px;cursor:pointer}.account-menu summary::-webkit-details-marker{display:none}.account-menu summary:hover{background:var(--surface-hover)}.avatar{width:42px;height:42px;border-radius:10px;border:1px solid var(--border);background:linear-gradient(145deg,#d8dde5,#fff);display:grid;place-items:center;color:#8b95a3;font-weight:850}.account-copy{display:flex;flex-direction:column;min-width:78px;line-height:1.25}.account-copy strong{font-size:14px}.account-copy small{font-size:12px;color:var(--muted)}.account-dropdown{position:absolute;right:0;top:56px;width:172px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px;box-shadow:var(--shadow);z-index:60}.account-dropdown button{width:100%;border:0;background:transparent;border-radius:7px;text-align:left;padding:10px 12px;cursor:pointer}.account-dropdown button:hover{background:var(--surface-hover)}
-    .app-nav{height:var(--nav-height);background:var(--surface);border-bottom:1px solid var(--border);position:relative;z-index:30}.nav-inner{height:100%;max-width:1140px;margin:0 auto;display:flex;align-items:center;gap:2px;padding:0 18px;width:100%}.nav-link{height:var(--nav-height);border:0;background:transparent;color:var(--muted);display:flex;align-items:center;gap:7px;padding:0 12px;text-decoration:none;font-size:13px;font-weight:620;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap}.nav-link:hover,.nav-link.active,.nav-dropdown.active>.nav-link{color:var(--text);background:var(--surface-soft);border-bottom-color:var(--green)}.nav-link .chevron{width:14px;height:14px;transition:transform .18s}.nav-dropdown{height:100%;position:relative}.nav-dropdown:focus-within .chevron,.nav-dropdown:hover .chevron{transform:rotate(180deg)}.nav-menu{position:absolute;left:0;top:calc(100% - 2px);width:220px;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:8px;box-shadow:0 16px 38px rgba(31,42,57,.15);opacity:0;visibility:hidden;transform:translateY(-6px);transition:.16s;z-index:70}.nav-dropdown:hover .nav-menu,.nav-dropdown:focus-within .nav-menu{opacity:1;visibility:visible;transform:none}.nav-menu a{display:flex;align-items:center;gap:10px;color:var(--text);text-decoration:none;border-radius:7px;padding:11px 12px;font-size:14px}.nav-menu a:hover,.nav-menu a.active{background:var(--surface-hover);color:var(--green-dark)}
-    .layout{width:100%;max-width:1140px;margin:0 auto;padding:16px 18px 28px;flex:1}.view{display:none}.view.active{display:block;animation:fadeIn .18s ease}@keyframes fadeIn{from{opacity:.5;transform:translateY(3px)}to{opacity:1;transform:none}}.view-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.view-heading h1{font-size:16px;letter-spacing:0;margin:0 0 2px;font-weight:700}.view-heading p{margin:0;color:var(--muted);font-size:12px}.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:12px}.stat-card{min-height:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;box-shadow:none;display:flex;align-items:center;gap:12px;padding:14px 16px;transition:none}.stat-card:hover{transform:none;box-shadow:none}.stat-icon{width:38px;height:38px;border-radius:6px;color:#fff;display:grid;place-items:center;flex:0 0 auto}.stat-icon.green{background:#2fb344}.stat-icon.orange{background:var(--orange)}.stat-icon.blue{background:var(--blue)}.stat-icon.red{background:var(--red)}.stat-icon .icon{width:18px;height:18px;stroke-width:2}.stat-copy{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}.stat-copy strong{font-size:15px;letter-spacing:0;font-weight:700}.stat-copy span{color:var(--text);font-size:14px;white-space:nowrap;font-weight:500}.dashboard-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:10px}.panel{background:var(--surface);border:1px solid var(--border);border-radius:6px;box-shadow:none;overflow:hidden}.panel-accent-green{border-top:2px solid var(--green)}.panel-accent-pink{border-top:2px solid var(--pink)}.panel-head{min-height:0;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px}.panel-head h2{font-size:15px;margin:0;font-weight:700}.panel-subtitle{font-size:12px;color:var(--muted);margin-top:1px}.help-button{width:28px;height:28px;border:1px solid var(--border);border-radius:6px;background:var(--surface);display:grid;place-items:center;color:var(--muted);cursor:pointer}.help-button:hover{background:var(--surface-hover);color:var(--text)}.recent-list{min-height:0}.recent-row{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) 88px;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border)}.recent-row:last-child{border-bottom:0}.recent-domain{font-weight:720}.recent-target{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.button{border:0;border-radius:6px;padding:8px 12px;font-weight:650;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;text-decoration:none;font-size:13px}.button-primary{background:var(--green);color:#fff;box-shadow:0 4px 10px rgba(92,165,0,.2)}.button-primary:hover{background:var(--green-dark)}.button-secondary{background:var(--surface);color:var(--text);border:1px solid var(--border)}.button-secondary:hover{background:var(--surface-hover)}.button-danger{background:transparent;color:#c92a2a;border:1px solid #f1b8b8}.button-danger:hover{background:#fff1f1}.button-sm{padding:5px 10px;font-size:12px;border-radius:6px}.button .icon{width:17px;height:17px}
+    .app-header{height:var(--header-height);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0;position:relative;z-index:80;overflow:visible}.app-header-inner{height:100%;width:100%;max-width:1140px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;position:relative;overflow:visible}.brand{display:flex;align-items:center;gap:10px;color:var(--text);text-decoration:none;font-size:16px;font-weight:720;letter-spacing:-.01em}.brand-logo{width:30px;height:30px;display:grid;place-items:center;clip-path:polygon(50% 0,92% 24%,92% 76%,50% 100%,8% 76%,8% 24%);background:conic-gradient(from 25deg,#ff8b00,#f13576,#7657df,#1971c2,#ff8b00);padding:3px;filter:drop-shadow(0 3px 6px rgba(90,68,181,.14))}.brand-logo span{width:100%;height:100%;display:grid;place-items:center;clip-path:inherit;background:var(--surface);color:#6f56d9;font-size:11px;font-weight:900}.header-actions{display:flex;align-items:center;gap:10px;position:relative;z-index:90;overflow:visible}.language{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}.icon-button{width:40px;height:40px;border:0;border-radius:9px;background:transparent;display:grid;place-items:center;cursor:pointer;color:var(--text)}.icon-button:hover{background:var(--surface-hover)}.sun-icon{display:none}:root[data-theme="dark"] .moon-icon{display:none}:root[data-theme="dark"] .sun-icon{display:block}.account-menu{position:relative}.account-menu summary{list-style:none;display:flex;align-items:center;gap:10px;padding:5px 7px;border-radius:10px;cursor:pointer}.account-menu summary::-webkit-details-marker{display:none}.account-menu summary:hover{background:var(--surface-hover)}.avatar{width:42px;height:42px;border-radius:10px;border:1px solid var(--border);background:linear-gradient(145deg,#d8dde5,#fff);display:grid;place-items:center;color:#8b95a3;font-weight:850}.account-copy{display:flex;flex-direction:column;min-width:78px;line-height:1.25}.account-copy strong{font-size:14px}.account-copy small{font-size:12px;color:var(--muted)}.account-dropdown{position:fixed;top:0;right:0;width:180px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px;box-shadow:0 12px 32px rgba(17,24,39,.18);z-index:10000;display:none}.account-menu[open] > .account-dropdown{display:block}.account-dropdown form{margin:0}.account-dropdown button{width:100%;border:0;background:transparent;border-radius:7px;text-align:left;padding:10px 12px;cursor:pointer;color:var(--text)}.account-dropdown button:hover{background:var(--surface-hover)}
+    .app-nav{height:var(--nav-height);background:var(--surface);border-bottom:1px solid var(--border);position:relative;z-index:30}.nav-inner{height:100%;max-width:1140px;margin:0 auto;display:flex;align-items:center;gap:2px;padding:0 18px;width:100%}.nav-link{height:var(--nav-height);border:0;background:transparent;color:var(--muted);display:flex;align-items:center;gap:7px;padding:0 12px;text-decoration:none;font-size:13px;font-weight:620;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap}.nav-link:hover,.nav-link.active,.nav-dropdown.active>.nav-link{color:var(--text);background:var(--surface-soft);border-bottom-color:var(--green)}.nav-link .chevron{width:14px;height:14px;transition:transform .18s}.app-nav{z-index:30}.nav-dropdown{height:100%;position:relative}.nav-dropdown.open .chevron,.nav-dropdown:focus-within .chevron{transform:rotate(180deg)}.nav-menu{position:absolute;left:0;top:100%;width:230px;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:8px;box-shadow:0 16px 38px rgba(31,42,57,.15);opacity:0;visibility:hidden;pointer-events:none;transform:translateY(4px);transition:.12s;z-index:80}.nav-menu::before{content:"";position:absolute;left:0;right:0;top:-10px;height:10px}.nav-dropdown.open .nav-menu,.nav-dropdown:focus-within .nav-menu{opacity:1;visibility:visible;pointer-events:auto;transform:none}.nav-menu a{display:flex;align-items:center;gap:10px;color:var(--text);text-decoration:none;border-radius:7px;padding:11px 12px;font-size:14px;cursor:pointer}.nav-menu a:hover,.nav-menu a.active{background:var(--surface-hover);color:var(--green-dark)}
+    .layout{width:100%;max-width:1140px;margin:0 auto;padding:16px 18px 28px;flex:1}.view{display:none}.view.active{display:block;animation:fadeIn .18s ease}@keyframes fadeIn{from{opacity:.5;transform:translateY(3px)}to{opacity:1;transform:none}}.view-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.view-heading h1{font-size:16px;letter-spacing:0;margin:0 0 2px;font-weight:700}.view-heading p{margin:0;color:var(--muted);font-size:12px}.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:12px}.stat-card{min-height:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;box-shadow:none;display:flex;align-items:center;gap:12px;padding:14px 16px;transition:none}.stat-card:hover{transform:none;box-shadow:none}.stat-icon{width:38px;height:38px;border-radius:6px;color:#fff;display:grid;place-items:center;flex:0 0 auto}.stat-icon.green{background:#2fb344}.stat-icon.orange{background:var(--orange)}.stat-icon.blue{background:var(--blue)}.stat-icon.red{background:var(--red)}.stat-icon .icon{width:18px;height:18px;stroke-width:2}.stat-copy{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}.stat-copy strong{font-size:15px;letter-spacing:0;font-weight:700}.stat-copy span{color:var(--text);font-size:14px;white-space:nowrap;font-weight:500}.dashboard-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:10px}.panel{background:var(--surface);border:1px solid var(--border);border-radius:6px;box-shadow:none;overflow:hidden}.panel-accent-green{border-top:2px solid var(--green)}.panel-accent-pink{border-top:2px solid var(--pink)}.panel-head{min-height:0;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px}.panel-head h2{font-size:15px;margin:0;font-weight:700}.panel-subtitle{font-size:12px;color:var(--muted);margin-top:1px}.help-button{width:28px;height:28px;border:1px solid var(--border);border-radius:6px;background:var(--surface);display:grid;place-items:center;color:var(--muted);cursor:pointer}.help-button:hover{background:var(--surface-hover);color:var(--text)}.recent-list{min-height:0}.recent-row{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) 88px;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border)}.recent-row:last-child{border-bottom:0}.recent-domain{font-weight:720}.recent-target{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.button{border:0;border-radius:6px;padding:8px 12px;font-weight:650;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;text-decoration:none;font-size:13px}.button.is-disabled,.button:disabled{opacity:.55;cursor:not-allowed;pointer-events:none}.button-primary{background:var(--green);color:#fff;box-shadow:0 4px 10px rgba(92,165,0,.2)}.button-primary:hover{background:var(--green-dark)}.button-secondary{background:var(--surface);color:var(--text);border:1px solid var(--border)}.button-secondary:hover{background:var(--surface-hover)}.button-danger{background:transparent;color:#c92a2a;border:1px solid #f1b8b8}.button-danger:hover{background:#fff1f1}.button-sm{padding:5px 10px;font-size:12px;border-radius:6px}.button .icon{width:17px;height:17px}
     .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:720px}th,td{text-align:left;padding:11px 16px;border-bottom:1px solid var(--border);font-size:13px}th{background:var(--surface-soft);color:var(--muted);font-size:12px;font-weight:750;text-transform:uppercase;letter-spacing:.045em}tbody tr:hover{background:var(--surface-soft)}tbody tr:last-child td{border-bottom:0}.domain-cell{display:flex;align-items:center;gap:11px}.domain-dot{width:9px;height:9px;border-radius:50%;background:#adb5bd;box-shadow:0 0 0 4px rgba(173,181,189,.15)}.domain-dot.enabled{background:#2fb344;box-shadow:0 0 0 4px rgba(47,179,68,.13)}.domain-name{font-weight:750}.domain-link{color:var(--blue);text-decoration:none}.domain-link:hover{text-decoration:underline}.recent-domain.domain-link{font-weight:720}.quick-url-field{margin-bottom:12px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-soft)}.quick-url-field > label{margin-bottom:6px}.quick-url-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}.quick-url-row input{width:100%;min-height:38px}.quick-url-field .hint{margin-top:6px}.target{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);font-size:12px}.badge{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:650;min-width:52px}.badge.on{background:#e9f8d6;color:#477c00}.badge.off{background:#edf0f4;color:#697586}.actions{display:flex;gap:8px}.empty-state{min-height:0;padding:40px 16px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}.empty-icon{width:44px;height:44px;border-radius:12px;background:var(--green-soft);color:var(--green-dark);display:grid;place-items:center;margin-bottom:10px}.empty-icon .icon{width:22px;height:22px}.empty-state h2{font-size:16px;margin:0 0 4px}.empty-state p{color:var(--muted);font-size:12px;margin:0 0 14px}.compact-empty{min-height:0;padding:28px 16px}.managed-state{min-height:0;padding:40px 16px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}.managed-state .empty-icon{background:#fff0f6;color:var(--pink)}.managed-state h2{font-size:22px;margin:0 0 8px}.managed-state p{max-width:620px;color:var(--muted);line-height:1.7;margin:0}.managed-tags{display:flex;gap:9px;flex-wrap:wrap;justify-content:center;margin-top:22px}.managed-tag{background:var(--surface-soft);border:1px solid var(--border);border-radius:999px;padding:7px 11px;color:var(--muted);font-size:12px}.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.setting-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;box-shadow:0 3px 12px rgba(32,43,58,.04)}.setting-card .setting-icon{width:44px;height:44px;border-radius:10px;background:var(--surface-soft);display:grid;place-items:center;color:var(--green-dark);margin-bottom:18px}.setting-card h2{font-size:17px;margin:0 0 8px}.setting-card p{font-size:13px;color:var(--muted);line-height:1.7;margin:0}.page-footer{min-height:44px;background:var(--surface);border-top:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0;color:var(--muted);font-size:12px}.page-footer-inner{width:100%;max-width:1140px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;gap:12px}
-    dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0;border-radius:10px;padding:0;background:var(--surface);color:var(--text);box-shadow:0 20px 70px rgba(17,24,39,.28)}dialog::backdrop{background:rgba(23,31,43,.66);backdrop-filter:blur(2px)}.modal-form{display:flex;flex-direction:column;max-height:calc(100vh - 36px)}.modal-head{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}.modal-title{display:flex;align-items:center;gap:12px}.modal-title-mark{width:36px;height:36px;border-radius:9px;background:var(--green-soft);color:var(--green-dark);display:grid;place-items:center}.modal-head h2{margin:0;font-size:20px}.close-button{width:38px;height:38px;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer;display:grid;place-items:center}.close-button:hover{background:var(--surface-hover);color:var(--text)}.tabs{display:flex;border-bottom:1px solid var(--border);padding:0 22px}.tab{border:0;background:transparent;padding:15px 17px;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent}.tab.active{color:var(--text);border-bottom-color:var(--green);font-weight:750}.modal-body{overflow:auto}.tab-panel{display:none;padding:14px 16px}.tab-panel.active{display:block}.grid{display:grid;grid-template-columns:1fr 1.5fr .7fr;gap:15px}.field{margin-bottom:12px}.field label{display:block;font-size:13px;font-weight:750;margin-bottom:7px}.field input,.field select,.field textarea{width:100%;border:1px solid var(--border);border-radius:8px;padding:11px 12px;outline:none;background:var(--surface);color:var(--text)}.field textarea{min-height:170px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(108,190,8,.14)}.hint{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.6}.switches{display:grid;grid-template-columns:1fr 1fr;gap:12px}.switch{display:flex;align-items:center;justify-content:space-between;border:1px solid var(--border);border-radius:9px;padding:13px 14px;background:var(--surface-soft)}.switch input{width:19px;height:19px;accent-color:var(--green)}.info{background:#eff6ff;border:1px solid #cfe1ff;color:#385777;border-radius:9px;padding:14px;font-size:13px;line-height:1.7}:root[data-theme="dark"] .info{background:#202d42;border-color:#31476a;color:#b7cef3}.modal-foot{display:flex;justify-content:space-between;padding:12px 16px;border-top:1px solid var(--border);background:var(--surface-soft)}.toast{position:fixed;right:24px;bottom:24px;background:#263444;color:#fff;padding:12px 16px;border-radius:9px;opacity:0;transform:translateY(12px);pointer-events:none;transition:.2s;z-index:100}.toast.show{opacity:1;transform:none}.toast.error{background:#b42318}
+    
+    
+    .cf-help-box{margin:0 0 14px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface-soft)}
+    .cf-help-title{font-size:13px;font-weight:700;margin:0 0 8px;color:var(--text)}
+    .cf-help-steps{margin:0 0 8px;padding-left:18px;color:var(--muted);font-size:12px;line-height:1.7}
+    .cf-help-steps li{margin:0 0 4px}
+    .cf-help-box a{color:var(--blue);text-decoration:none;word-break:break-all}
+    .cf-help-box a:hover{text-decoration:underline}
+.cf-settings-panel{margin-bottom:4px}.cf-settings-body{padding:14px 16px 16px}.cf-settings-desc{margin:0 0 12px;color:var(--muted);font-size:13px;line-height:1.6}
+    .cf-settings-actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+    .cf-meta{font-size:12px;color:var(--muted);margin-bottom:10px}
+    .cf-status{display:inline-flex;align-items:center;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:650;background:#edf0f4;color:#697586}
+    .cf-status.on{background:#e9f8d6;color:#477c00}.cf-status.err{background:#ffe3e3;color:#c92a2a}
+    .cf-zone-list{display:flex;flex-wrap:wrap;gap:8px}
+    .zone-chip,.zone-chip-btn{border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:5px 10px;font-size:12px;color:var(--text)}
+    .zone-chip-btn{cursor:pointer}.zone-chip-btn:hover{border-color:var(--blue);color:var(--blue)}
+    .domain-picker{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
+    .zone-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0;border-radius:10px;padding:0;background:var(--surface);color:var(--text);box-shadow:0 20px 70px rgba(17,24,39,.28)}dialog::backdrop{background:rgba(23,31,43,.66);backdrop-filter:blur(2px)}.modal-form{display:flex;flex-direction:column;max-height:calc(100vh - 36px)}.modal-head{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}.modal-title{display:flex;align-items:center;gap:12px}.modal-title-mark{width:36px;height:36px;border-radius:9px;background:var(--green-soft);color:var(--green-dark);display:grid;place-items:center}.modal-head h2{margin:0;font-size:20px}.close-button{width:38px;height:38px;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer;display:grid;place-items:center}.close-button:hover{background:var(--surface-hover);color:var(--text)}.tabs{display:flex;border-bottom:1px solid var(--border);padding:0 22px}.tab{border:0;background:transparent;padding:15px 17px;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent}.tab.active{color:var(--text);border-bottom-color:var(--green);font-weight:750}.modal-body{overflow:auto}.tab-panel{display:none;padding:14px 16px}.tab-panel.active{display:block}.grid{display:grid;grid-template-columns:1fr 1.5fr .7fr;gap:15px}.field{margin-bottom:12px}.field label{display:block;font-size:13px;font-weight:750;margin-bottom:7px}.field input,.field select,.field textarea{width:100%;border:1px solid var(--border);border-radius:8px;padding:11px 12px;outline:none;background:var(--surface);color:var(--text)}.field textarea{min-height:170px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(108,190,8,.14)}.hint{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.6}.switches{display:grid;grid-template-columns:1fr 1fr;gap:12px}.switch{display:flex;align-items:center;justify-content:space-between;border:1px solid var(--border);border-radius:9px;padding:13px 14px;background:var(--surface-soft)}.switch input{width:19px;height:19px;accent-color:var(--green)}.info{background:#eff6ff;border:1px solid #cfe1ff;color:#385777;border-radius:9px;padding:14px;font-size:13px;line-height:1.7}:root[data-theme="dark"] .info{background:#202d42;border-color:#31476a;color:#b7cef3}.modal-foot{display:flex;justify-content:space-between;padding:12px 16px;border-top:1px solid var(--border);background:var(--surface-soft)}
+    
+    .cert-summary{margin-bottom:12px}
+    .cert-badge{display:inline-flex;align-items:center;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:650}
+    .cert-badge.active{background:#e9f8d6;color:#477c00}
+    .cert-badge.pending,.cert-badge.limited{background:#fff3bf;color:#9c6b00}
+    .cert-badge.warning,.cert-badge.unmanaged,.cert-badge.error,.cert-badge.unknown{background:#ffe3e3;color:#c92a2a}
+    .cert-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted)}
+.dialog-sm{width:min(420px,calc(100% - 24px));border-radius:12px;overflow:hidden}
+    .password-body{padding:18px 20px 8px}
+    .password-body .field{margin-bottom:14px}
+    .password-body .field:last-child{margin-bottom:10px}
+    .password-body .field label{display:block;font-size:13px;font-weight:650;color:var(--text);margin:0 0 8px}
+    .password-body .field input{display:block;width:100%;box-sizing:border-box;min-height:42px;border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--surface);color:var(--text)}
+    .password-body .field input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(108,190,8,.14);outline:none}
+    .password-foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--border);background:var(--surface-soft)}
+    .password-foot .button{min-width:84px}
+.toast{position:fixed;right:24px;bottom:24px;background:#263444;color:#fff;padding:12px 16px;border-radius:9px;opacity:0;transform:translateY(12px);pointer-events:none;transition:.2s;z-index:100}.toast.show{opacity:1;transform:none}.toast.error{background:#b42318}
     @media(max-width:1100px){.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-grid{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr 1fr}}@media(max-width:760px){:root{--header-height:52px;--nav-height:46px}.app-header-inner{padding:0 12px}.brand{font-size:15px}.brand-logo{width:28px;height:28px}.language,.account-copy{display:none}.nav-inner{padding:0 12px;overflow:visible}.nav-link{padding:0 12px}.nav-link span{display:none}.layout{padding:14px 12px 28px}.view-heading{align-items:stretch;flex-direction:column}.summary{grid-template-columns:1fr;gap:12px}.stat-card{min-height:0}.settings-grid{grid-template-columns:1fr}.panel-head{padding:17px 18px}.recent-row{grid-template-columns:1fr}.recent-target{display:none}.page-footer{padding:17px 16px;align-items:flex-start;flex-direction:column}.grid{grid-template-columns:1fr}.switches{grid-template-columns:1fr}.tab-panel{padding:20px 18px}.modal-foot{padding:15px 18px}.nav-menu{left:-58px}}
   </style>
 </head>
@@ -775,17 +1367,17 @@ function dashboardPage(username) {
       </button>
       <details class="account-menu">
         <summary><span class="avatar">EP</span><span class="account-copy"><strong>${escapeHtml(username)}</strong><small>管理员</small></span></summary>
-        <div class="account-dropdown"><form method="post" action="/logout"><button type="submit">退出登录</button></form></div>
+        <div class="account-dropdown">
+          <button type="button" id="openPasswordDialog">修改密码</button>
+          <form method="post" action="/logout"><button type="submit">退出登录</button></form>
+        </div>
       </details>
     </div>
     </div></header>
   <nav class="app-nav" aria-label="主导航">
     <div class="nav-inner">
       <a class="nav-link active" href="#dashboard" data-view-link="dashboard"><svg class="icon" viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v10h13V10M9.5 20v-6h5v6"/></svg><span>仪表板</span></a>
-      <div class="nav-dropdown" id="hostNav">
-        <button class="nav-link" type="button"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span>主机列表</span><svg class="icon chevron" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></svg></button>
-        <div class="nav-menu"><a href="#proxies" data-view-link="proxies"><svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/><circle cx="5" cy="12" r="2"/></svg>代理服务列表</a></div>
-      </div>
+      <a class="nav-link" href="#proxies" data-view-link="proxies" id="navProxiesLink"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span>主机列表</span></a>
       <a class="nav-link" href="#certificates" data-view-link="certificates"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3 20 7v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4Z"/><path d="m9 12 2 2 4-4"/></svg><span>证书状态</span></a>
       <a class="nav-link" href="#settings" data-view-link="settings"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg><span>设置</span></a>
     </div>
@@ -803,57 +1395,428 @@ function dashboardPage(username) {
         <section class="panel panel-accent-green"><div class="panel-head"><div><h2>最近代理服务</h2></div><a class="button button-secondary button-sm" href="#proxies" data-view-link="proxies">查看全部</a></div><div class="recent-list" id="recentProxies"></div></section>
       </div>
     </section>
-    <section class="view" data-view="proxies">
+    <section class="view" data-view="proxies" id="proxiesView">
       <div class="view-heading"><div><h1>代理服务列表</h1></div><button class="button button-primary open-editor" id="headerAddProxy" type="button" hidden><svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>添加代理服务</button></div>
       <section class="panel panel-accent-green">
-        <div class="panel-head" id="proxyPanelHead" hidden><div><h2>主机列表</h2><div class="panel-subtitle">Cloudflare Worker 反向代理主机</div></div><button class="help-button" type="button" title="代理域名需要绑定到此 Worker"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.4 2.4 0 1 1 3.3 2.2c-.8.4-1.1.9-1.1 1.8M12 17h.01"/></svg></button></div>
+        <div class="panel-head" id="proxyPanelHead" hidden><div><h2>主机列表</h2></div><button class="help-button" type="button" title="需绑定到当前 Worker"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.4 2.4 0 1 1 3.3 2.2c-.8.4-1.1.9-1.1 1.8M12 17h.01"/></svg></button></div>
         <div class="table-wrap" id="proxyTableWrap" hidden><table><thead><tr><th>域名</th><th>转发目标</th><th>状态</th><th>WebSocket</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="proxyRows"></tbody></table></div>
-        <div class="empty-state" id="emptyState"><span class="empty-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/><circle cx="5" cy="12" r="2"/></svg></span><h2>没有代理服务</h2><p>创建第一条配置，让 Cloudflare Worker 开始反向代理。</p><button class="button button-primary open-editor" type="button"><svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>添加代理服务</button></div>
+        <div class="empty-state" id="emptyState"><span class="empty-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/><circle cx="5" cy="12" r="2"/></svg></span><h2>暂无代理</h2><p>添加第一条代理规则</p><button class="button button-primary open-editor" type="button"><svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>添加代理服务</button></div>
       </section>
     </section>
     <section class="view" data-view="certificates">
-      <div class="view-heading"><div><h1>证书状态</h1></div></div>
-      <section class="panel panel-accent-pink"><div class="panel-head"><div><h2>Cloudflare 托管证书</h2><div class="panel-subtitle">无需在源站安装 HTTPS 证书</div></div><button class="help-button" type="button" title="Worker 到 HTTP 源站的连接不使用访客证书"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.4 2.4 0 1 1 3.3 2.2c-.8.4-1.1.9-1.1 1.8M12 17h.01"/></svg></button></div><div class="managed-state"><span class="empty-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3 20 7v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4Z"/><path d="m9 12 2 2 4-4"/></svg></span><h2>证书已交由 Cloudflare 管理</h2><p>Custom Domain 会自动提供 HTTPS、处理证书签发与续期。代理目标仍可使用 HTTP，例如公网源站的 80 或自定义端口。</p><div class="managed-tags"><span class="managed-tag">自动签发</span><span class="managed-tag">自动续期</span><span class="managed-tag">TLS 边缘终止</span><span class="managed-tag">HTTP 回源支持</span></div></div></section>
+      <div class="view-heading">
+        <div><h1>证书状态</h1></div>
+        <button class="button button-secondary button-sm" type="button" id="refreshCertificates">刷新</button>
+      </div>
+      <div class="summary cert-summary">
+        <article class="stat-card"><span class="stat-icon green"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3 20 7v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4Z"/><path d="m9 12 2 2 4-4"/></svg></span><div class="stat-copy"><strong id="certActiveCount">0</strong><span>已生效</span></div></article>
+        <article class="stat-card"><span class="stat-icon orange"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16h.01"/></svg></span><div class="stat-copy"><strong id="certPendingCount">0</strong><span>处理中</span></div></article>
+        <article class="stat-card"><span class="stat-icon red"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/></svg></span><div class="stat-copy"><strong id="certIssueCount">0</strong><span>异常/未托管</span></div></article>
+        <article class="stat-card"><span class="stat-icon blue"><svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/><circle cx="5" cy="12" r="2"/></svg></span><div class="stat-copy"><strong id="certTotalCount">0</strong><span>代理域名</span></div></article>
+      </div>
+      <section class="panel panel-accent-pink">
+        <div class="panel-head">
+          <div><h2>域名证书</h2></div>
+          <span class="cf-status" id="certCfBadge">—</span>
+        </div>
+        <div class="table-wrap" id="certTableWrap" hidden>
+          <table>
+            <thead>
+              <tr>
+                <th>域名</th>
+                <th>Zone</th>
+                <th>证书状态</th>
+                <th>SSL 模式</th>
+                <th>强制 HTTPS</th>
+                <th>回源</th>
+              </tr>
+            </thead>
+            <tbody id="certRows"></tbody>
+          </table>
+        </div>
+        <div class="empty-state" id="certEmpty">
+          <span class="empty-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3 20 7v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4Z"/><path d="m9 12 2 2 4-4"/></svg></span>
+          <h2>暂无证书数据</h2>
+          <p id="certEmptyText">添加代理后显示证书状态</p>
+        </div>
+      </section>
     </section>
     <section class="view" data-view="settings">
       <div class="view-heading"><div><h1>设置</h1></div></div>
-      <div class="settings-grid">
-        <article class="setting-card"><span class="setting-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></span><h2>配置存储</h2><p>代理规则保存在 Cloudflare KV，通过 PROXY_CONFIG 绑定读取和更新。</p></article>
-        <article class="setting-card"><span class="setting-icon"><svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span><h2>管理会话</h2><p>登录状态使用签名 Cookie 保存，会话有效期为 8 小时并启用 Secure 与 SameSite。</p></article>
-        <article class="setting-card"><span class="setting-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 15-4M20 12a8 8 0 0 1-15 4"/><path d="m19 4 .2 4-4-.2M5 20l-.2-4 4 .2"/></svg></span><h2>回源能力</h2><p>支持 HTTP、HTTPS、WebSocket、重定向改写、Cookie 域名改写和自定义 Locations。</p></article>
-      </div>
+      <section class="panel cf-settings-panel">
+        <div class="panel-head"><div><h2>Cloudflare API</h2></div><span class="cf-status" id="cfStatusBadge">未绑定</span></div>
+        <div class="cf-settings-body">
+          <div class="cf-help-box">
+            <div class="cf-help-title">获取 API 令牌</div>
+            <ol class="cf-help-steps">
+              <li>Cloudflare 头像 → <strong>配置文件</strong> → <strong>API 令牌</strong></li>
+              <li>或打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">dash.cloudflare.com/profile/api-tokens</a></li>
+              <li><strong>创建令牌</strong>，权限至少：区域 → 区域 → 读取；可选 SSL 和证书 → 读取</li>
+              <li>不要用 Global API Key</li>
+            </ol>
+          </div>
+          <div class="field"><label for="cfApiToken">API 令牌</label><input id="cfApiToken" type="password" autocomplete="off" placeholder="粘贴 API 令牌"></div>
+          <div class="cf-settings-actions">
+            <button type="button" class="button button-primary" id="saveCfToken">保存并验证</button>
+            <button type="button" class="button button-secondary" id="refreshCfZones">刷新域名列表</button>
+            <button type="button" class="button button-danger" id="removeCfToken">解除绑定</button>
+          </div>
+          <div class="cf-meta" id="cfMeta">尚未绑定 Cloudflare API。</div>
+          <div class="cf-zone-list" id="cfZoneList"></div>
+        </div>
+      </section>
     </section>
   </main>
-  <footer class="page-footer"><div class="page-footer-inner"><span>© 2026 Edge Proxy Manager</span><span class="build-id">build open-source</span><span>Powered by Cloudflare Workers · HTTPS 证书自动管理</span></div></footer>
+  <footer class="page-footer"><div class="page-footer-inner"><span>© 2026 Edge Proxy Manager</span><span class="build-id">build open-source</span><span>Cloudflare Workers</span></div></footer>
   <dialog id="editor">
     <form id="proxyForm" class="modal-form">
       <div class="modal-head"><div class="modal-title"><span class="modal-title-mark"><svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/><circle cx="5" cy="12" r="2"/></svg></span><h2 id="dialogTitle">添加代理服务</h2></div><button type="button" class="close-button" id="closeDialog" aria-label="关闭"><svg class="icon" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
       <div class="tabs"><button type="button" class="tab active" data-tab="details">详情</button><button type="button" class="tab" data-tab="locations">自定义路径</button><button type="button" class="tab" data-tab="ssl">SSL</button></div>
       <div class="modal-body">
-        <section class="tab-panel active" data-panel="details"><input type="hidden" id="originalDomain"><div class="field"><label for="domain">代理域名</label><input id="domain" placeholder="api.example.com" required><div class="hint">该域名还需要在 Cloudflare 中绑定到当前 Worker。</div></div><div class="field quick-url-field"><label for="originUrl">快速粘贴源站链接</label><div class="quick-url-row"><input id="originUrl" placeholder="http://origin.example.com:8080/management.html#/" autocomplete="off"><button type="button" class="button button-secondary button-sm" id="parseOriginUrl">解析填入</button></div><div class="hint">粘贴完整源站 URL，自动填入下方协议 / 主机 / 端口 / 路径 / Hash。</div></div><div class="grid"><div class="field"><label for="scheme">回源协议</label><select id="scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></div><div class="field"><label for="targetHost">公网源站主机名 / IP</label><input id="targetHost" placeholder="origin.example.com" required></div><div class="field"><label for="targetPort">端口</label><input id="targetPort" type="number" min="1" max="65535" value="80" required></div></div><div class="grid"><div class="field"><label for="landingPath">默认入口路径</label><input id="landingPath" placeholder="/management.html"></div><div class="field"><label for="landingHash">入口 Hash</label><input id="landingHash" placeholder="/"><div class="hint">填写 / 将生成 #/</div></div><div class="field"></div></div><div class="switches"><label class="switch"><span>启用代理</span><input id="enabled" type="checkbox" checked></label><label class="switch"><span>WebSocket 支持</span><input id="websocket" type="checkbox"></label><label class="switch"><span>阻止常见攻击</span><input id="blockExploits" type="checkbox" checked></label></div></section>
-        <section class="tab-panel" data-panel="locations"><div class="field"><label for="locationsText">自定义路径规则</label><textarea id="locationsText" placeholder="/api = http://api.example.com:8080&#10;/assets = https://static.example.com:443"></textarea><div class="hint">每行一条，格式：路径 = http(s)://主机:端口。匹配时优先使用最长路径。</div></div></section>
-        <section class="tab-panel" data-panel="ssl"><div class="info">访问者证书由 Cloudflare Custom Domain 自动管理。这里的回源协议决定 Worker 使用 HTTP 还是 HTTPS 连接目标源站。</div><div class="switches" style="margin-top:16px"><label class="switch"><span>强制 HTTPS</span><input id="forceHttps" type="checkbox" checked></label><label class="switch"><span>启用 HSTS</span><input id="hsts" type="checkbox"></label></div></section>
+        <section class="tab-panel active" data-panel="details"><input type="hidden" id="originalDomain"><div class="field"><label for="domain">代理域名</label>
+          <div class="domain-picker">
+            <input id="domain" list="cfDomainSuggestions" placeholder="api.example.com" required autocomplete="off">
+            <button type="button" class="button button-secondary button-sm" id="reloadDomainSuggestions" title="刷新 Cloudflare 域名">刷新</button>
+          </div>
+          <datalist id="cfDomainSuggestions"></datalist>
+          <div class="zone-chips" id="zoneChips"></div>
+          <div class="hint" id="domainHint">选择已托管域名，或手动输入子域名</div>
+        </div><div class="field quick-url-field"><label for="originUrl">快速粘贴源站链接</label><div class="quick-url-row"><input id="originUrl" placeholder="http://origin.example.com:8080/" autocomplete="off"><button type="button" class="button button-secondary button-sm" id="parseOriginUrl">解析填入</button></div></div><div class="grid"><div class="field"><label for="scheme">回源协议</label><select id="scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></div><div class="field"><label for="targetHost">公网源站主机名 / IP</label><input id="targetHost" placeholder="origin.example.com" required></div><div class="field"><label for="targetPort">端口</label><input id="targetPort" type="number" min="1" max="65535" value="80" required></div></div><div class="grid"><div class="field"><label for="landingPath">默认入口路径</label><input id="landingPath" placeholder="/management.html"></div><div class="field"><label for="landingHash">入口 Hash</label><input id="landingHash" placeholder="/"></div><div class="field"></div></div><div class="switches"><label class="switch"><span>启用代理</span><input id="enabled" type="checkbox" checked></label><label class="switch"><span>WebSocket 支持</span><input id="websocket" type="checkbox"></label><label class="switch"><span>阻止常见攻击</span><input id="blockExploits" type="checkbox" checked></label></div></section>
+        <section class="tab-panel" data-panel="locations"><div class="field"><label for="locationsText">自定义路径规则</label><textarea id="locationsText" placeholder="/api = http://api.example.com:8080&#10;/assets = https://static.example.com:443"></textarea><div class="hint">每行：/path = http://host:port</div></div></section>
+        <section class="tab-panel" data-panel="ssl"><div class="switches" style="margin-top:16px"><label class="switch"><span>强制 HTTPS</span><input id="forceHttps" type="checkbox" checked></label><label class="switch"><span>启用 HSTS</span><input id="hsts" type="checkbox"></label></div></section>
       </div>
       <div class="modal-foot"><button type="button" class="button button-secondary" id="cancelDialog">取消</button><button type="submit" class="button button-primary">保存代理服务</button></div>
     </form>
   </dialog>
+  
+  <dialog id="passwordDialog" class="dialog-sm">
+    <form id="passwordForm" class="modal-form">
+      <div class="modal-head"><div class="modal-title"><span class="modal-title-mark"><svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span><h2>修改密码</h2></div><button type="button" class="close-button" id="closePasswordDialog" aria-label="关闭"><svg class="icon" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+      <div class="modal-body password-body">
+        <div class="field">
+          <label for="currentPassword">当前密码</label>
+          <input id="currentPassword" type="password" autocomplete="current-password" required placeholder="请输入当前密码">
+        </div>
+        <div class="field">
+          <label for="newPassword">新密码</label>
+          <input id="newPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="至少 8 位">
+        </div>
+        <div class="field">
+          <label for="confirmPassword">确认新密码</label>
+          <input id="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="再次输入新密码">
+        </div>
+      </div>
+      <div class="modal-foot password-foot">
+        <button type="button" class="button button-secondary" id="cancelPasswordDialog">取消</button>
+        <button type="submit" class="button button-primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
   <div class="toast" id="toast"></div>
   <script nonce="{{NONCE}}">
-    const state = { proxies: [] };
+    const state = { proxies: [], certificates: [], cf: { configured: false, accountName: "", zones: [], loading: false } };
     const editor = document.getElementById("editor");
     const form = document.getElementById("proxyForm");
     const fields = Object.fromEntries([
       "originalDomain","originUrl","domain","scheme","targetHost","targetPort","landingPath","landingHash","locationsText","enabled","websocket","blockExploits","forceHttps","hsts"
     ].map(id => [id, document.getElementById(id)]));
 
-    function showToast(message, error = false) {
+    
+    const passwordDialog = document.getElementById("passwordDialog");
+    const passwordForm = document.getElementById("passwordForm");
+
+    function openPasswordDialog() {
+      if (!passwordForm || !passwordDialog) return;
+      passwordForm.reset();
+      document.querySelectorAll(".account-menu[open]").forEach((menu) => menu.removeAttribute("open"));
+      if (typeof passwordDialog.showModal === "function") passwordDialog.showModal();
+      else passwordDialog.setAttribute("open", "");
+      document.getElementById("currentPassword")?.focus();
+    }
+
+    function closePasswordDialog() {
+      if (!passwordDialog) return;
+      if (typeof passwordDialog.close === "function") passwordDialog.close();
+      else passwordDialog.removeAttribute("open");
+    }
+
+
+    function certBadge(status, text) {
+      const span = document.createElement("span");
+      const key = String(status || "unknown");
+      span.className = "cert-badge " + key;
+      span.textContent = text || key;
+      return span;
+    }
+
+    function renderCertificates() {
+      const rows = document.getElementById("certRows");
+      const table = document.getElementById("certTableWrap");
+      const empty = document.getElementById("certEmpty");
+      const emptyText = document.getElementById("certEmptyText");
+      const badge = document.getElementById("certCfBadge");
+      if (!rows || !table || !empty) return;
+
+      const list = state.certificates || [];
+      const active = list.filter((item) => item.status === "active").length;
+      const pending = list.filter((item) => item.status === "pending" || item.status === "limited").length;
+      const issues = list.filter((item) => ["warning", "unmanaged", "error", "unknown"].includes(item.status)).length;
+
+      const setText = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = String(value);
+      };
+      setText("certActiveCount", active);
+      setText("certPendingCount", pending);
+      setText("certIssueCount", issues);
+      setText("certTotalCount", list.length);
+
+      if (badge) {
+        if (!state.cf.configured) {
+          badge.textContent = "未绑定 API";
+          badge.className = "cf-status";
+        } else {
+          badge.textContent = "Cloudflare 托管";
+          badge.className = "cf-status on";
+        }
+      }
+
+      rows.replaceChildren();
+      if (!list.length) {
+        table.hidden = true;
+        empty.hidden = false;
+        if (emptyText) {
+          emptyText.textContent = state.cf.configured
+            ? "添加代理后显示证书状态"
+            : "绑定 Cloudflare API 并添加代理后显示";
+        }
+        return;
+      }
+
+      empty.hidden = true;
+      table.hidden = false;
+      for (const item of list) {
+        const tr = document.createElement("tr");
+        const domain = document.createElement("td");
+        const domainLink = document.createElement("a");
+        domainLink.className = "domain-link";
+        domainLink.href = "https://" + item.domain;
+        domainLink.target = "_blank";
+        domainLink.rel = "noopener noreferrer";
+        domainLink.textContent = "https://" + item.domain;
+        domain.append(domainLink);
+
+        const zone = document.createElement("td");
+        zone.textContent = item.zone || "—";
+
+        const status = document.createElement("td");
+        status.append(certBadge(item.status, item.statusText || item.status));
+
+        const mode = document.createElement("td");
+        mode.className = "cert-mono";
+        mode.textContent = item.sslMode || "—";
+
+        const https = document.createElement("td");
+        https.textContent = item.forceHttps ? "是" : "否";
+
+        const origin = document.createElement("td");
+        origin.className = "cert-mono";
+        origin.textContent = item.origin || "—";
+
+        tr.append(domain, zone, status, mode, https, origin);
+        rows.append(tr);
+      }
+    }
+
+    async function loadCertificates(silent = false) {
+      try {
+        const data = await requestJson("/api/certificates");
+        state.certificates = data.certificates || [];
+        if (typeof data.configured === "boolean") {
+          state.cf.configured = data.configured;
+        }
+        if (data.accountName) state.cf.accountName = data.accountName;
+        renderCertificates();
+        updateCloudflareGate();
+        if (!silent && data.error) showToast(data.error, true);
+      } catch (error) {
+        if (!silent) showToast(error.message, true);
+        renderCertificates();
+      }
+    }
+
+function showToast(message, error = false) {
       const toast = document.getElementById("toast");
       toast.textContent = message;
       toast.className = "toast show" + (error ? " error" : "");
       setTimeout(() => toast.className = "toast", 2800);
     }
 
-    async function requestJson(path, options = {}) {
+    function renderCfStatus() {
+      const badge = document.getElementById("cfStatusBadge");
+      const meta = document.getElementById("cfMeta");
+      const list = document.getElementById("cfZoneList");
+      if (!badge || !meta || !list) return;
+      if (state.cf.configured) {
+        badge.textContent = "已绑定";
+        badge.className = "cf-status on";
+        const parts = [];
+        if (state.cf.accountName) parts.push(state.cf.accountName);
+        parts.push((state.cf.zones?.length || 0) + " 个托管域名");
+        if (state.cf.verifiedAt) parts.push("验证于 " + new Date(state.cf.verifiedAt).toLocaleString());
+        meta.textContent = parts.join(" · ");
+      } else {
+        badge.textContent = "未绑定";
+        badge.className = "cf-status";
+        meta.textContent = "未绑定";
+      }
+      list.replaceChildren();
+      for (const zone of state.cf.zones || []) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "zone-chip-btn";
+        chip.textContent = zone.name + (zone.status && zone.status !== "active" ? (" (" + zone.status + ")") : "");
+        chip.title = "填入子域示例：api." + zone.name;
+        chip.addEventListener("click", () => {
+          fields.domain.value = "api." + zone.name;
+          fields.domain.focus();
+          selectTab("details");
+        });
+        list.append(chip);
+      }
+    }
+
+    function renderDomainSuggestions() {
+      const datalist = document.getElementById("cfDomainSuggestions");
+      const chips = document.getElementById("zoneChips");
+      const hint = document.getElementById("domainHint");
+      if (!datalist || !chips) return;
+      datalist.replaceChildren();
+      chips.replaceChildren();
+      const zones = state.cf.zones || [];
+      if (!state.cf.configured) {
+        if (hint) hint.textContent = "请先绑定 Cloudflare API";
+        return;
+      }
+      if (hint) hint.textContent = zones.length + " 个可用域名";
+      for (const zone of zones) {
+        for (const value of [zone.name, "api." + zone.name, "www." + zone.name]) {
+          const opt = document.createElement("option");
+          opt.value = value;
+          datalist.append(opt);
+        }
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "zone-chip-btn";
+        chip.textContent = zone.name;
+        chip.addEventListener("click", () => {
+          const current = fields.domain.value.trim();
+          if (!current || current.endsWith("." + zone.name) || current === zone.name) {
+            fields.domain.value = current && current !== zone.name ? current : "api." + zone.name;
+          } else if (!current.includes(".")) {
+            fields.domain.value = current + "." + zone.name;
+          } else {
+            fields.domain.value = "api." + zone.name;
+          }
+          fields.domain.focus();
+        });
+        chips.append(chip);
+      }
+    }
+
+    async function loadCloudflareSettings() {
+      try {
+        const data = await requestJson("/api/settings/cloudflare");
+        state.cf.configured = Boolean(data.configured);
+        state.cf.accountName = data.accountName || "";
+        state.cf.verifiedAt = data.verifiedAt || "";
+        state.cf.zoneCount = data.zoneCount;
+        renderCfStatus();
+        if (data.configured) {
+          await loadCloudflareZones(true);
+        } else {
+          state.cf.zones = [];
+          renderDomainSuggestions();
+          renderCfStatus();
+          updateCloudflareGate();
+        }
+      } catch (error) {
+        // ignore on first paint
+        renderCfStatus();
+      }
+    }
+
+    async function loadCloudflareZones(silent = false) {
+      if (state.cf.loading) return;
+      state.cf.loading = true;
+      try {
+        const data = await requestJson("/api/cloudflare/zones");
+        state.cf.configured = true;
+        state.cf.accountName = data.accountName || state.cf.accountName || "";
+        state.cf.zones = data.zones || [];
+        state.cf.zoneCount = state.cf.zones.length;
+        state.cf.verifiedAt = new Date().toISOString();
+        renderCfStatus();
+        renderDomainSuggestions();
+        updateCloudflareGate();
+        if (!silent) showToast("已刷新 " + state.cf.zones.length + " 个域名");
+      } catch (error) {
+        if (String(error.message || "").includes("尚未绑定")) {
+          state.cf.configured = false;
+          state.cf.zones = [];
+          renderCfStatus();
+          renderDomainSuggestions();
+        }
+        if (!silent) showToast(error.message, true);
+      } finally {
+        state.cf.loading = false;
+      }
+    }
+
+    async function saveCloudflareToken() {
+      const apiToken = document.getElementById("cfApiToken").value.trim();
+      if (!apiToken) {
+        showToast("请先粘贴 API Token", true);
+        return;
+      }
+      try {
+        const data = await requestJson("/api/settings/cloudflare", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ apiToken }),
+        });
+        document.getElementById("cfApiToken").value = "";
+        state.cf.configured = true;
+        state.cf.accountName = data.accountName || "";
+        state.cf.verifiedAt = data.verifiedAt || "";
+        state.cf.zones = data.zones || [];
+        state.cf.zoneCount = state.cf.zones.length;
+        renderCfStatus();
+        renderDomainSuggestions();
+        updateCloudflareGate();
+        showToast("已绑定 " + state.cf.zones.length + " 个域名");
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    }
+
+    async function removeCloudflareToken() {
+      if (!confirm("确定解除 Cloudflare API 绑定？")) return;
+      try {
+        await requestJson("/api/settings/cloudflare", { method: "DELETE" });
+        state.cf = { configured: false, accountName: "", zones: [], loading: false };
+        document.getElementById("cfApiToken").value = "";
+        renderCfStatus();
+        renderDomainSuggestions();
+        updateCloudflareGate();
+        showToast("已解除绑定");
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    }
+
+async function requestJson(path, options = {}) {
       const response = await fetch(path, options);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "请求失败 (" + response.status + ")");
@@ -867,9 +1830,21 @@ function dashboardPage(username) {
 
     function showView(name) {
       document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.dataset.view === name));
-      document.querySelectorAll("[data-view-link]").forEach(link => link.classList.toggle("active", link.dataset.viewLink === name));
-      document.getElementById("hostNav").classList.toggle("active", name === "proxies");
+      document.querySelectorAll("[data-view-link]").forEach(link => {
+        const active = link.dataset.viewLink === name;
+        link.classList.toggle("active", active);
+      });
       document.querySelectorAll(".account-menu[open]").forEach(menu => menu.removeAttribute("open"));
+      if (name === "certificates") loadCertificates(true);
+    }
+
+    function navigateTo(name) {
+      const target = ["dashboard", "proxies", "certificates", "settings"].includes(name) ? name : "dashboard";
+      const current = location.hash.replace(/^#/, "") || "dashboard";
+      if (current !== target) {
+        location.hash = target;
+      }
+      showView(target);
     }
 
     function setTheme(theme) {
@@ -930,7 +1905,17 @@ function dashboardPage(username) {
       return true;
     }
 
-function openEditor(config = null) {
+function requireCloudflareBound(actionLabel = "操作") {
+      if (!state.cf.configured) {
+        showToast("请先绑定 Cloudflare API", true);
+        navigateTo("settings");
+        return false;
+      }
+      return true;
+    }
+
+    function openEditor(config = null) {
+      if (!requireCloudflareBound(config ? "编辑代理映射" : "添加代理映射")) return;
       form.reset();
       fields.originUrl.value = "";
       fields.enabled.checked = true;
@@ -958,6 +1943,7 @@ function openEditor(config = null) {
       fields.forceHttps.checked = config ? config.forceHttps : true;
       fields.hsts.checked = config?.hsts || false;
       document.getElementById("dialogTitle").textContent = config ? "编辑代理服务" : "添加代理服务";
+      renderDomainSuggestions();
       selectTab("details");
       if (typeof editor.showModal === "function") editor.showModal();
       else editor.setAttribute("open", "");
@@ -984,9 +1970,9 @@ function openEditor(config = null) {
         const empty = document.createElement("div");
         empty.className = "empty-state compact-empty";
         const title = document.createElement("h2");
-        title.textContent = "暂无代理服务";
+        title.textContent = "暂无代理";
         const description = document.createElement("p");
-        description.textContent = "创建第一条配置后会显示在这里。";
+        description.textContent = "添加后显示在这里";
         const button = document.createElement("button");
         button.className = "button button-primary";
         button.type = "button";
@@ -1012,6 +1998,20 @@ function openEditor(config = null) {
         target.textContent = config.scheme + "://" + config.targetHost + ":" + config.targetPort;
         row.append(domain, target, createStatusBadge(config.enabled));
         recent.append(row);
+      }
+    }
+
+    function updateCloudflareGate() {
+      const enabled = Boolean(state.cf.configured);
+      document.querySelectorAll(".open-editor, #headerAddProxy").forEach((btn) => {
+        if (!btn) return;
+        btn.disabled = !enabled;
+        btn.title = enabled ? "" : "请先绑定 Cloudflare API 令牌";
+        btn.classList.toggle("is-disabled", !enabled);
+      });
+      const hint = document.getElementById("domainHint");
+      if (hint && !enabled) {
+        hint.textContent = "请先绑定 Cloudflare API";
       }
     }
 
@@ -1078,6 +2078,8 @@ function openEditor(config = null) {
         const data = await requestJson("/api/proxies");
         state.proxies = data.proxies;
         render();
+        updateCloudflareGate();
+        if ((location.hash.replace(/^#/, "") || "dashboard") === "certificates") loadCertificates(true);
       } catch (error) {
         showToast(error.message, true);
       }
@@ -1094,6 +2096,74 @@ function openEditor(config = null) {
       }
     }
 
+    
+    
+    
+    function positionAccountMenu() {
+      const menu = document.querySelector(".account-menu");
+      const dropdown = document.querySelector(".account-dropdown");
+      const summary = menu?.querySelector("summary");
+      if (!menu || !dropdown || !summary || !menu.open) return;
+      const rect = summary.getBoundingClientRect();
+      const width = dropdown.offsetWidth || 180;
+      const top = Math.round(rect.bottom + 8);
+      let left = Math.round(rect.right - width);
+      left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+      dropdown.style.top = top + "px";
+      dropdown.style.left = left + "px";
+      dropdown.style.right = "auto";
+    }
+
+    const accountMenu = document.querySelector(".account-menu");
+    accountMenu?.addEventListener("toggle", () => {
+      if (accountMenu.open) {
+        positionAccountMenu();
+        requestAnimationFrame(positionAccountMenu);
+      }
+    });
+    window.addEventListener("resize", () => {
+      if (accountMenu?.open) positionAccountMenu();
+    });
+    window.addEventListener("scroll", () => {
+      if (accountMenu?.open) positionAccountMenu();
+    }, true);
+
+
+    document.getElementById("openPasswordDialog")?.addEventListener("click", (event) => {
+      event.preventDefault();
+      openPasswordDialog();
+    });
+    document.getElementById("closePasswordDialog")?.addEventListener("click", closePasswordDialog);
+    document.getElementById("cancelPasswordDialog")?.addEventListener("click", closePasswordDialog);
+    passwordDialog?.addEventListener("click", (event) => {
+      if (event.target === passwordDialog) closePasswordDialog();
+    });
+    passwordForm?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const currentPassword = document.getElementById("currentPassword").value;
+      const newPassword = document.getElementById("newPassword").value;
+      const confirmPassword = document.getElementById("confirmPassword").value;
+      try {
+        await requestJson("/api/account/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ currentPassword, newPassword, confirmPassword }),
+        });
+        closePasswordDialog();
+        showToast("密码已更新");
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
+
+    
+    document.getElementById("refreshCertificates")?.addEventListener("click", () => loadCertificates(false));
+
+    document.getElementById("saveCfToken").addEventListener("click", saveCloudflareToken);
+    document.getElementById("refreshCfZones").addEventListener("click", () => loadCloudflareZones(false));
+    document.getElementById("removeCfToken").addEventListener("click", removeCloudflareToken);
+    document.getElementById("reloadDomainSuggestions").addEventListener("click", () => loadCloudflareZones(false));
+
     document.getElementById("parseOriginUrl").addEventListener("click", () => parseOriginUrl(fields.originUrl.value));
     fields.originUrl.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -1109,6 +2179,15 @@ function openEditor(config = null) {
     document.getElementById("cancelDialog").addEventListener("click", closeEditor);
     document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => selectTab(tab.dataset.tab)));
     document.getElementById("themeToggle").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
+    
+    // Event delegation: more reliable than per-link hover menus
+    document.addEventListener("click", (event) => {
+      const link = event.target.closest("[data-view-link]");
+      if (!link) return;
+      event.preventDefault();
+      navigateTo(link.dataset.viewLink);
+    });
+
     window.addEventListener("hashchange", () => showView(currentView()));
     fields.scheme.addEventListener("change", () => {
       if (fields.targetPort.value === "80" || fields.targetPort.value === "443") fields.targetPort.value = fields.scheme.value === "https" ? "443" : "80";
@@ -1119,6 +2198,7 @@ function openEditor(config = null) {
 
     form.addEventListener("submit", async event => {
       event.preventDefault();
+      if (!requireCloudflareBound("保存代理映射")) return;
       const payload = {
         originalDomain: fields.originalDomain.value,
         domain: fields.domain.value,
@@ -1156,6 +2236,8 @@ function openEditor(config = null) {
     else if (matchMedia("(prefers-color-scheme: dark)").matches) setTheme("dark");
     showView(currentView());
     loadProxies();
+    loadCloudflareSettings();
+    updateCloudflareGate();
   </script>
 </body>
 </html>`;
