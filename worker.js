@@ -1528,7 +1528,49 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
     .cert-badge.pending,.cert-badge.limited{background:#fff3bf;color:#9c6b00}
     .cert-badge.warning,.cert-badge.unmanaged,.cert-badge.error,.cert-badge.unknown{background:#ffe3e3;color:#c92a2a}
     .cert-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted)}
-.dialog-sm{width:min(420px,calc(100% - 24px));border-radius:12px;overflow:hidden}
+
+    #editor{width:min(700px,calc(100% - 24px));border-radius:12px}
+    #editor .modal-head{padding:16px 20px}
+    #editor .modal-body{background:var(--surface)}
+    #editor .tabs{padding:0 20px}
+    #editor .tab{padding:12px 14px;font-size:13px;font-weight:650}
+    #editor .tab-panel{padding:18px 20px 20px}
+    .proxy-details-panel{display:none}
+    .proxy-details-panel.active{display:block}
+    .form-section{padding:14px;border:1px solid var(--border);border-radius:10px;background:var(--surface);margin-bottom:12px}
+    .origin-section{background:var(--surface-soft)}
+    .section-heading{display:flex;align-items:flex-start;gap:9px;margin:0 0 12px}
+    .section-heading h3{font-size:14px;line-height:1.3;margin:0;color:var(--text)}
+    .section-heading p{font-size:12px;line-height:1.4;margin:3px 0 0;color:var(--muted)}
+    .section-step{width:20px;height:20px;border-radius:50%;background:var(--green-soft);color:var(--green-dark);font-size:12px;font-weight:750;display:grid;place-items:center;flex:0 0 auto}
+    #editor .field{margin-bottom:0}
+    #editor .field label{font-size:12px;margin-bottom:6px}
+    .quick-url-field{margin:0 0 12px;padding:0;border:0;background:transparent}
+    .quick-url-field > label{font-size:12px;font-weight:650;margin-bottom:6px}
+    .quick-url-field > label span{color:var(--muted);font-weight:400}
+    .quick-url-row input{min-height:40px}
+    .source-grid{display:grid;grid-template-columns:100px minmax(0,1fr) 90px;gap:10px}
+    .entry-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .advanced-options{border:1px solid var(--border);border-radius:9px;background:var(--surface);overflow:hidden}
+    .advanced-options summary{cursor:pointer;list-style:none;padding:12px 14px;font-size:13px;font-weight:650;display:flex;align-items:center;justify-content:space-between}
+    .advanced-options summary::-webkit-details-marker{display:none}
+    .advanced-options summary::after{content:"⌄";color:var(--muted);font-size:16px;transition:transform .15s}
+    .advanced-options[open] summary{border-bottom:1px solid var(--border)}
+    .advanced-options[open] summary::after{transform:rotate(180deg)}
+    .advanced-content{padding:14px}
+    .compact-switches{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:12px}
+    .compact-switches .switch{padding:10px 11px;border-radius:8px;font-size:12px}
+    .rule-panel .section-heading{margin-bottom:16px}
+    @media(max-width:640px){
+      #editor .modal-head{padding:14px 16px}
+      #editor .tabs,#editor .tab-panel{padding-left:16px;padding-right:16px}
+      .source-grid,.entry-grid{grid-template-columns:1fr}
+      .compact-switches{grid-template-columns:1fr}
+      .quick-url-row{grid-template-columns:1fr}
+      .domain-picker{grid-template-columns:1fr}
+    }
+
+    .dialog-sm{width:min(420px,calc(100% - 24px));border-radius:12px;overflow:hidden}
     .password-body{padding:18px 20px 8px}
     .password-body .field{margin-bottom:14px}
     .password-body .field:last-child{margin-bottom:10px}
@@ -1660,19 +1702,55 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
   <dialog id="editor">
     <form id="proxyForm" class="modal-form">
       <div class="modal-head"><div class="modal-title"><span class="modal-title-mark"><svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/><circle cx="5" cy="12" r="2"/></svg></span><h2 id="dialogTitle">添加代理服务</h2></div><button type="button" class="close-button" id="closeDialog" aria-label="关闭"><svg class="icon" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
-      <div class="tabs"><button type="button" class="tab active" data-tab="details">详情</button><button type="button" class="tab" data-tab="locations">自定义路径</button><button type="button" class="tab" data-tab="ssl">SSL</button></div>
+      <div class="tabs"><button type="button" class="tab active" data-tab="details">基础配置</button><button type="button" class="tab" data-tab="locations">路径规则</button><button type="button" class="tab" data-tab="ssl">HTTPS</button></div>
       <div class="modal-body">
-        <section class="tab-panel active" data-panel="details"><input type="hidden" id="originalDomain"><div class="field"><label for="domain">代理域名</label>
-          <div class="domain-picker">
-            <input id="domain" list="cfDomainSuggestions" placeholder="api.example.com" required autocomplete="off">
-            <button type="button" class="button button-secondary button-sm" id="reloadDomainSuggestions" title="刷新 Cloudflare 域名">刷新</button>
-          </div>
-          <datalist id="cfDomainSuggestions"></datalist>
-          <div class="zone-chips" id="zoneChips"></div>
-          <div class="hint" id="domainHint">选择已托管域名，或手动输入子域名</div>
-        </div><div class="field quick-url-field"><label for="originUrl">快速粘贴源站链接</label><div class="quick-url-row"><input id="originUrl" placeholder="http://origin.example.com:8080/" autocomplete="off"><button type="button" class="button button-secondary button-sm" id="parseOriginUrl">解析填入</button></div></div><div class="grid"><div class="field"><label for="scheme">回源协议</label><select id="scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></div><div class="field"><label for="targetHost">公网源站主机名 / IP</label><input id="targetHost" placeholder="origin.example.com" required></div><div class="field"><label for="targetPort">端口</label><input id="targetPort" type="number" min="1" max="65535" value="80" required></div></div><div class="grid"><div class="field"><label for="landingPath">默认入口路径</label><input id="landingPath" placeholder="/management.html"></div><div class="field"><label for="landingHash">入口 Hash</label><input id="landingHash" placeholder="/"></div><div class="field"></div></div><div class="switches"><label class="switch"><span>启用代理</span><input id="enabled" type="checkbox" checked></label><label class="switch"><span>WebSocket 支持</span><input id="websocket" type="checkbox"></label><label class="switch"><span>阻止常见攻击</span><input id="blockExploits" type="checkbox" checked></label></div></section>
-        <section class="tab-panel" data-panel="locations"><div class="field"><label for="locationsText">自定义路径规则</label><textarea id="locationsText" placeholder="/api = http://api.example.com:8080&#10;/assets = https://static.example.com:443"></textarea><div class="hint">每行：/path = http://host:port</div></div></section>
-        <section class="tab-panel" data-panel="ssl"><div class="switches" style="margin-top:16px"><label class="switch"><span>强制 HTTPS</span><input id="forceHttps" type="checkbox" checked></label><label class="switch"><span>启用 HSTS</span><input id="hsts" type="checkbox"></label></div></section>
+        <section class="tab-panel active proxy-details-panel" data-panel="details">
+          <input type="hidden" id="originalDomain">
+
+          <section class="form-section domain-section">
+            <div class="section-heading"><span class="section-step">1</span><div><h3>代理域名</h3><p>用户访问的公开地址</p></div></div>
+            <div class="domain-picker">
+              <input id="domain" list="cfDomainSuggestions" placeholder="api.example.com" required autocomplete="off">
+              <button type="button" class="button button-secondary button-sm" id="reloadDomainSuggestions" title="刷新 Cloudflare 域名">刷新</button>
+            </div>
+            <datalist id="cfDomainSuggestions"></datalist>
+            <div class="zone-chips" id="zoneChips"></div>
+            <div class="hint" id="domainHint">选择已托管域名，或手动输入子域名</div>
+          </section>
+
+          <section class="form-section origin-section">
+            <div class="section-heading"><span class="section-step">2</span><div><h3>源站地址</h3><p>Worker 将流量转发到这里</p></div></div>
+            <div class="quick-url-field">
+              <label for="originUrl">粘贴完整源站链接 <span>可选</span></label>
+              <div class="quick-url-row">
+                <input id="originUrl" placeholder="http://origin.example.com:8080/" autocomplete="off">
+                <button type="button" class="button button-secondary button-sm" id="parseOriginUrl">自动填入</button>
+              </div>
+            </div>
+            <div class="source-grid">
+              <div class="field"><label for="scheme">协议</label><select id="scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></div>
+              <div class="field"><label for="targetHost">主机名或 IP</label><input id="targetHost" placeholder="origin.example.com" required></div>
+              <div class="field"><label for="targetPort">端口</label><input id="targetPort" type="number" min="1" max="65535" value="80" required></div>
+            </div>
+          </section>
+
+          <details class="advanced-options">
+            <summary>高级选项</summary>
+            <div class="advanced-content">
+              <div class="entry-grid">
+                <div class="field"><label for="landingPath">默认入口路径</label><input id="landingPath" placeholder="/management.html"></div>
+                <div class="field"><label for="landingHash">入口 Hash</label><input id="landingHash" placeholder="/"></div>
+              </div>
+              <div class="switches compact-switches">
+                <label class="switch"><span>启用代理</span><input id="enabled" type="checkbox" checked></label>
+                <label class="switch"><span>WebSocket</span><input id="websocket" type="checkbox"></label>
+                <label class="switch"><span>阻止常见攻击</span><input id="blockExploits" type="checkbox" checked></label>
+              </div>
+            </div>
+          </details>
+        </section>
+        <section class="tab-panel rule-panel" data-panel="locations"><div class="section-heading"><div><h3>路径规则</h3><p>匹配指定路径时，转发到不同源站</p></div></div><div class="field"><label for="locationsText">规则</label><textarea id="locationsText" placeholder="/api = http://api.example.com:8080&#10;/assets = https://static.example.com:443"></textarea><div class="hint">每行一条：路径 = 源站</div></div></section>
+        <section class="tab-panel rule-panel" data-panel="ssl"><div class="section-heading"><div><h3>HTTPS</h3><p>访客侧的 HTTPS 由 Cloudflare 处理</p></div></div><div class="switches compact-switches"><label class="switch"><span>强制 HTTPS</span><input id="forceHttps" type="checkbox" checked></label><label class="switch"><span>启用 HSTS</span><input id="hsts" type="checkbox"></label></div></section>
       </div>
       <div class="modal-foot"><button type="button" class="button button-secondary" id="cancelDialog">取消</button><button type="submit" class="button button-primary">保存代理服务</button></div>
     </form>
@@ -1932,7 +2010,7 @@ function showToast(message, error = false) {
           const chip = document.createElement("button");
           chip.type = "button";
           chip.className = "zone-chip-btn";
-          chip.textContent = zone.name + (zone.tokenName ? " · " + zone.tokenName : "");
+          chip.textContent = zone.name;
           chip.title = "填入 api." + zone.name;
           chip.addEventListener("click", () => {
             fields.domain.value = "api." + zone.name;
@@ -2435,26 +2513,26 @@ function openEditor(config = null) {
     
     document.getElementById("refreshCertificates")?.addEventListener("click", () => loadCertificates(false));
 
-    document.getElementById("saveCfToken").addEventListener("click", saveCloudflareToken);
-    document.getElementById("refreshCfZones").addEventListener("click", () => loadCloudflareZones(false));
-    document.getElementById("removeCfToken").addEventListener("click", removeCloudflareToken);
-    document.getElementById("reloadDomainSuggestions").addEventListener("click", () => loadCloudflareZones(false));
+    document.getElementById("saveCfToken")?.addEventListener("click", saveCloudflareToken);
+    document.getElementById("refreshCfZones")?.addEventListener("click", () => loadCloudflareZones(false));
+    document.getElementById("removeCfToken")?.addEventListener("click", () => removeCloudflareToken());
+    document.getElementById("reloadDomainSuggestions")?.addEventListener("click", () => loadCloudflareZones(false));
 
-    document.getElementById("parseOriginUrl").addEventListener("click", () => parseOriginUrl(fields.originUrl.value));
-    fields.originUrl.addEventListener("keydown", (event) => {
+    document.getElementById("parseOriginUrl")?.addEventListener("click", () => parseOriginUrl(fields.originUrl.value));
+    fields.originUrl?.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
         parseOriginUrl(fields.originUrl.value);
       }
     });
-    fields.originUrl.addEventListener("paste", () => {
+    fields.originUrl?.addEventListener("paste", () => {
       setTimeout(() => parseOriginUrl(fields.originUrl.value, { silent: true }), 0);
     });
     document.querySelectorAll(".open-editor").forEach(button => button.addEventListener("click", () => openEditor()));
-    document.getElementById("closeDialog").addEventListener("click", closeEditor);
-    document.getElementById("cancelDialog").addEventListener("click", closeEditor);
+    document.getElementById("closeDialog")?.addEventListener("click", closeEditor);
+    document.getElementById("cancelDialog")?.addEventListener("click", closeEditor);
     document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => selectTab(tab.dataset.tab)));
-    document.getElementById("themeToggle").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
+    document.getElementById("themeToggle")?.addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
     
     // Event delegation: more reliable than per-link hover menus
     document.addEventListener("click", (event) => {
@@ -2465,14 +2543,14 @@ function openEditor(config = null) {
     });
 
     window.addEventListener("hashchange", () => showView(currentView()));
-    fields.scheme.addEventListener("change", () => {
+    fields.scheme?.addEventListener("change", () => {
       if (fields.targetPort.value === "80" || fields.targetPort.value === "443") fields.targetPort.value = fields.scheme.value === "https" ? "443" : "80";
     });
-    editor.addEventListener("click", event => {
+    editor?.addEventListener("click", event => {
       if (event.target === editor) closeEditor();
     });
 
-    form.addEventListener("submit", async event => {
+    form?.addEventListener("submit", async event => {
       event.preventDefault();
       if (!requireCloudflareBound("保存代理映射")) return;
       const payload = {
