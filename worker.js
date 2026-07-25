@@ -105,7 +105,7 @@ async function handleAdminRequest(request, env, url) {
     }
 
     const cfSettings = await getCloudflareSettings(env.PROXY_CONFIG);
-    if (!cfSettings?.apiToken) {
+    if (!(cfSettings?.tokens || []).length) {
       return jsonResponse(
         { error: "请先绑定 Cloudflare API 令牌" },
         403,
@@ -127,7 +127,7 @@ async function handleAdminRequest(request, env, url) {
     }
 
     try {
-      const zones = await listCloudflareZones(cfSettings.apiToken);
+      const zones = await listZonesFromAllTokens(cfSettings);
       const domain = validation.config.domain;
       const matchedZone = findZoneForHostname(domain, zones);
       if (!matchedZone) {
@@ -194,12 +194,7 @@ async function handleAdminRequest(request, env, url) {
 
   if (url.pathname === "/api/settings/cloudflare" && request.method === "GET") {
     const settings = await getCloudflareSettings(env.PROXY_CONFIG);
-    return jsonResponse({
-      configured: Boolean(settings?.apiToken),
-      accountName: settings?.accountName || "",
-      verifiedAt: settings?.verifiedAt || "",
-      zoneCount: settings?.zoneCount ?? null,
-    });
+    return jsonResponse(publicCloudflareSettings(settings));
   }
 
   if (url.pathname === "/api/settings/cloudflare" && request.method === "POST") {
@@ -215,29 +210,40 @@ async function handleAdminRequest(request, env, url) {
     }
 
     const apiToken = String(input.apiToken || "").trim();
+    const tokenName = String(input.name || "").trim();
     if (!apiToken || apiToken.length < 20) {
-      return jsonResponse({ error: "请填写有效的 Cloudflare API Token" }, 400);
+      return jsonResponse({ error: "请填写有效的 API 令牌" }, 400);
     }
 
     try {
       const verified = await verifyCloudflareToken(apiToken);
       const zones = await listCloudflareZones(apiToken);
-      const settings = {
+      const settings = await getCloudflareSettings(env.PROXY_CONFIG);
+      // dedupe by exact token value
+      if (settings.tokens.some((item) => item.apiToken === apiToken)) {
+        return jsonResponse({ error: "该令牌已添加" }, 400);
+      }
+      const entry = {
+        id: cryptoRandomId(),
+        name: tokenName || verified.accountName || `令牌 ${settings.tokens.length + 1}`,
         apiToken,
         accountName: verified.accountName || "",
         verifiedAt: new Date().toISOString(),
         zoneCount: zones.length,
       };
+      settings.tokens.push(entry);
+      await env.PROXY_CONFIG.put(CF_SETTINGS_KEY, JSON.stringify(settings));
+      const allZones = await listZonesFromAllTokens(settings);
+      // persist refreshed zone counts
       await env.PROXY_CONFIG.put(CF_SETTINGS_KEY, JSON.stringify(settings));
       return jsonResponse({
-        configured: true,
-        accountName: settings.accountName,
-        verifiedAt: settings.verifiedAt,
-        zoneCount: settings.zoneCount,
-        zones: zones.map((z) => ({
+        ...publicCloudflareSettings(settings),
+        zones: allZones.map((z) => ({
           id: z.id,
           name: z.name,
           status: z.status,
+          tokenId: z.tokenId,
+          tokenName: z.tokenName,
         })),
       });
     } catch (error) {
@@ -252,8 +258,30 @@ async function handleAdminRequest(request, env, url) {
     if (!isSameOriginRequest(request, url)) {
       return jsonResponse({ error: "Forbidden" }, 403);
     }
-    await env.PROXY_CONFIG.delete(CF_SETTINGS_KEY);
-    return jsonResponse({ configured: false });
+
+    let tokenId = url.searchParams.get("id") || "";
+    if (!tokenId) {
+      try {
+        const body = await request.clone().json();
+        tokenId = String(body?.id || "");
+      } catch {
+        tokenId = "";
+      }
+    }
+
+    if (!tokenId) {
+      await env.PROXY_CONFIG.delete(CF_SETTINGS_KEY);
+      return jsonResponse({ configured: false, tokens: [], tokenCount: 0 });
+    }
+
+    const settings = await getCloudflareSettings(env.PROXY_CONFIG);
+    settings.tokens = (settings.tokens || []).filter((item) => item.id !== tokenId);
+    if (!settings.tokens.length) {
+      await env.PROXY_CONFIG.delete(CF_SETTINGS_KEY);
+      return jsonResponse({ configured: false, tokens: [], tokenCount: 0 });
+    }
+    await env.PROXY_CONFIG.put(CF_SETTINGS_KEY, JSON.stringify(settings));
+    return jsonResponse(publicCloudflareSettings(settings));
   }
 
   if (url.pathname === "/api/account/password" && request.method === "POST") {
@@ -300,7 +328,9 @@ async function handleAdminRequest(request, env, url) {
   if (url.pathname === "/api/certificates" && request.method === "GET") {
     const proxies = await listProxyConfigs(env.PROXY_CONFIG);
     const settings = await getCloudflareSettings(env.PROXY_CONFIG);
-    if (!settings?.apiToken) {
+    const hasTokens = (settings?.tokens || []).length > 0;
+
+    if (!hasTokens) {
       return jsonResponse({
         configured: false,
         certificates: proxies.map((proxy) => ({
@@ -311,15 +341,21 @@ async function handleAdminRequest(request, env, url) {
           hsts: Boolean(proxy.hsts),
           zone: null,
           status: "unknown",
-          statusText: "未绑定 Cloudflare API",
+          statusText: "未绑定 API",
           sslMode: null,
           hosts: [],
+          expiresOn: null,
+          daysLeft: null,
+          autoRenew: null,
+          issuer: null,
+          type: null,
         })),
       });
     }
 
     try {
-      const zones = await listCloudflareZones(settings.apiToken);
+      const zones = await listZonesFromAllTokens(settings);
+      await env.PROXY_CONFIG.put(CF_SETTINGS_KEY, JSON.stringify(settings));
       const zoneSslCache = new Map();
       const certificates = [];
 
@@ -329,16 +365,23 @@ async function handleAdminRequest(request, env, url) {
         let packs = [];
         let status = "pending";
         let statusText = "待确认";
+        let expiresOn = null;
+        let daysLeft = null;
+        let autoRenew = null;
+        let issuer = null;
+        let certType = null;
+        let hosts = proxy.domain ? [proxy.domain] : [];
 
         if (!zone) {
           status = "unmanaged";
           statusText = "域名未托管";
         } else {
-          if (!zoneSslCache.has(zone.id)) {
+          const token = (settings.tokens || []).find((item) => item.id === zone.tokenId);
+          if (!zoneSslCache.has(zone.id) && token?.apiToken) {
             try {
               const [mode, certPacks] = await Promise.all([
-                getZoneSslMode(settings.apiToken, zone.id),
-                listZoneCertificatePacks(settings.apiToken, zone.id),
+                getZoneSslMode(token.apiToken, zone.id),
+                listZoneCertificatePacks(token.apiToken, zone.id),
               ]);
               zoneSslCache.set(zone.id, { mode, packs: certPacks });
             } catch (error) {
@@ -349,60 +392,72 @@ async function handleAdminRequest(request, env, url) {
               });
             }
           }
+
           const cached = zoneSslCache.get(zone.id) || {};
           sslMode = cached.mode || null;
           packs = cached.packs || [];
-          const match = packs.find((pack) =>
-            (pack.hosts || []).some(
-              (host) =>
-                host === proxy.domain ||
-                host === "*." + zone.name ||
-                (host.startsWith("*.") &&
-                  (proxy.domain === host.slice(2) ||
-                    proxy.domain.endsWith("." + host.slice(2)))),
-            ),
-          );
+          const match =
+            packs.find((pack) =>
+              (pack.hosts || []).some(
+                (host) =>
+                  host === proxy.domain ||
+                  host === "*." + zone.name ||
+                  (host.startsWith("*.") &&
+                    (proxy.domain === host.slice(2) ||
+                      proxy.domain.endsWith("." + host.slice(2)))),
+              ),
+            ) || packs[0] || null;
+
           if (match) {
             const packStatus = String(match.status || "").toLowerCase();
-            if (["active", "issuing", "pending_validation", "pending_issuance", "pending_deployment"].includes(packStatus)) {
-              status = packStatus === "active" ? "active" : "pending";
-              statusText =
-                packStatus === "active"
-                  ? "已生效"
-                  : packStatus === "issuing" || packStatus.includes("pending")
-                    ? "签发中"
-                    : packStatus;
+            if (packStatus === "active") {
+              status = "active";
+              statusText = "已生效";
+            } else if (
+              packStatus === "issuing" ||
+              packStatus.includes("pending")
+            ) {
+              status = "pending";
+              statusText = "签发中";
             } else if (packStatus) {
               status = "warning";
               statusText = packStatus;
             } else {
               status = "active";
-              statusText = "Universal SSL";
+              statusText = "已托管";
             }
-            certificates.push({
-              domain: proxy.domain,
-              enabled: proxy.enabled !== false,
-              origin: createTargetOrigin(proxy.scheme, proxy.targetHost, proxy.targetPort),
-              forceHttps: Boolean(proxy.forceHttps),
-              hsts: Boolean(proxy.hsts),
-              zone: zone.name,
-              status,
-              statusText,
-              sslMode,
-              hosts: match.hosts || [proxy.domain],
-              expiresOn: match.expires_on || match.certificate_authority_expires_on || null,
-              type: match.type || "universal",
-            });
-            continue;
-          }
-
-          // No matching pack found - still CF hosted edge cert usually works for proxied hostnames
-          if (cached.error) {
+            expiresOn = match.expires_on || null;
+            autoRenew = match.auto_renew !== false;
+            certType = match.type || "universal";
+            hosts = match.hosts || hosts;
+            issuer = "Cloudflare";
+          } else if (cached.error) {
             status = "limited";
             statusText = "需 SSL 读权限";
+            autoRenew = true;
+            issuer = "Cloudflare";
           } else {
             status = "active";
             statusText = "边缘证书托管";
+            autoRenew = true;
+            issuer = "Cloudflare";
+            certType = "universal";
+          }
+
+          if (expiresOn) {
+            const exp = new Date(expiresOn).getTime();
+            if (!Number.isNaN(exp)) {
+              daysLeft = Math.ceil((exp - Date.now()) / 86400000);
+              if (daysLeft < 0) {
+                status = "warning";
+                statusText = "已过期";
+              } else if (daysLeft <= 14 && status === "active") {
+                statusText = "即将到期";
+              }
+            }
+          } else if (status === "active") {
+            // Universal SSL: Cloudflare auto-renews; no fixed end date exposed
+            autoRenew = true;
           }
         }
 
@@ -413,46 +468,52 @@ async function handleAdminRequest(request, env, url) {
           forceHttps: Boolean(proxy.forceHttps),
           hsts: Boolean(proxy.hsts),
           zone: zone?.name || null,
+          tokenName: zone?.tokenName || null,
           status,
           statusText,
           sslMode,
-          hosts: proxy.domain ? [proxy.domain] : [],
-          expiresOn: null,
-          type: zone ? "universal" : null,
+          hosts,
+          expiresOn,
+          daysLeft,
+          autoRenew,
+          issuer,
+          type: certType,
         });
       }
 
       return jsonResponse({
         configured: true,
-        accountName: settings.accountName || "",
+        tokenCount: settings.tokens.length,
         certificates,
       });
     } catch (error) {
-      return jsonResponse(
-        {
-          configured: true,
-          error: error instanceof Error ? error.message : "证书状态获取失败",
-          certificates: proxies.map((proxy) => ({
-            domain: proxy.domain,
-            enabled: proxy.enabled !== false,
-            origin: createTargetOrigin(proxy.scheme, proxy.targetHost, proxy.targetPort),
-            forceHttps: Boolean(proxy.forceHttps),
-            hsts: Boolean(proxy.hsts),
-            zone: null,
-            status: "error",
-            statusText: "查询失败",
-            sslMode: null,
-            hosts: [],
-          })),
-        },
-        200,
-      );
+      return jsonResponse({
+        configured: true,
+        error: error instanceof Error ? error.message : "证书状态获取失败",
+        certificates: proxies.map((proxy) => ({
+          domain: proxy.domain,
+          enabled: proxy.enabled !== false,
+          origin: createTargetOrigin(proxy.scheme, proxy.targetHost, proxy.targetPort),
+          forceHttps: Boolean(proxy.forceHttps),
+          hsts: Boolean(proxy.hsts),
+          zone: null,
+          status: "error",
+          statusText: "查询失败",
+          sslMode: null,
+          hosts: [],
+          expiresOn: null,
+          daysLeft: null,
+          autoRenew: null,
+          issuer: null,
+          type: null,
+        })),
+      });
     }
   }
 
   if (url.pathname === "/api/cloudflare/zones" && request.method === "GET") {
     const settings = await getCloudflareSettings(env.PROXY_CONFIG);
-    if (!settings?.apiToken) {
+    if (!(settings?.tokens || []).length) {
       return jsonResponse(
         { error: "未绑定 Cloudflare API", configured: false, zones: [] },
         400,
@@ -460,19 +521,18 @@ async function handleAdminRequest(request, env, url) {
     }
 
     try {
-      const zones = await listCloudflareZones(settings.apiToken);
-      // refresh cache metadata
-      settings.zoneCount = zones.length;
-      settings.verifiedAt = new Date().toISOString();
+      const zones = await listZonesFromAllTokens(settings);
       await env.PROXY_CONFIG.put(CF_SETTINGS_KEY, JSON.stringify(settings));
       return jsonResponse({
         configured: true,
-        accountName: settings.accountName || "",
+        tokenCount: settings.tokens.length,
         zones: zones.map((z) => ({
           id: z.id,
           name: z.name,
           status: z.status,
           plan: z.plan || "",
+          tokenId: z.tokenId,
+          tokenName: z.tokenName,
         })),
       });
     } catch (error) {
@@ -485,7 +545,7 @@ async function handleAdminRequest(request, env, url) {
 
   if (url.pathname.startsWith("/api/cloudflare/zones/") && url.pathname.endsWith("/dns") && request.method === "GET") {
     const settings = await getCloudflareSettings(env.PROXY_CONFIG);
-    if (!settings?.apiToken) {
+    if (!(settings?.tokens || []).length) {
       return jsonResponse({ error: "未绑定 Cloudflare API", records: [] }, 400);
     }
     const zoneId = decodeURIComponent(
@@ -495,7 +555,10 @@ async function handleAdminRequest(request, env, url) {
       return jsonResponse({ error: "zone id 无效" }, 400);
     }
     try {
-      const records = await listCloudflareDnsRecords(settings.apiToken, zoneId);
+      const zones = await listZonesFromAllTokens(settings);
+      const zone = zones.find((item) => item.id === zoneId);
+      const token = (settings.tokens || []).find((item) => item.id === zone?.tokenId) || settings.tokens[0];
+      const records = await listCloudflareDnsRecords(token.apiToken, zoneId);
       return jsonResponse({
         records: records.map((r) => ({
           id: r.id,
@@ -730,7 +793,112 @@ function secureStringEqual(a, b) {
 
 async function getCloudflareSettings(kv) {
   if (!kv?.get) return null;
-  return (await kv.get(CF_SETTINGS_KEY, "json")) || null;
+  const raw = (await kv.get(CF_SETTINGS_KEY, "json")) || null;
+  return normalizeCloudflareSettings(raw);
+}
+
+function normalizeCloudflareSettings(raw) {
+  if (!raw) {
+    return { tokens: [] };
+  }
+  // migrate legacy single-token shape
+  if (Array.isArray(raw.tokens)) {
+    return {
+      tokens: raw.tokens
+        .filter((item) => item && item.apiToken)
+        .map((item) => ({
+          id: item.id || cryptoRandomId(),
+          name: item.name || item.accountName || "Cloudflare",
+          apiToken: item.apiToken,
+          accountName: item.accountName || "",
+          verifiedAt: item.verifiedAt || "",
+          zoneCount: item.zoneCount ?? null,
+        })),
+    };
+  }
+  if (raw.apiToken) {
+    return {
+      tokens: [
+        {
+          id: raw.id || cryptoRandomId(),
+          name: raw.accountName || "Cloudflare",
+          apiToken: raw.apiToken,
+          accountName: raw.accountName || "",
+          verifiedAt: raw.verifiedAt || "",
+          zoneCount: raw.zoneCount ?? null,
+        },
+      ],
+    };
+  }
+  return { tokens: [] };
+}
+
+function cryptoRandomId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+  }
+  return String(Date.now()) + Math.random().toString(16).slice(2, 8);
+}
+
+function maskToken(token) {
+  const value = String(token || "");
+  if (value.length <= 10) return "********";
+  return value.slice(0, 4) + "..." + value.slice(-4);
+}
+
+function publicCloudflareSettings(settings) {
+  const tokens = (settings?.tokens || []).map((item) => ({
+    id: item.id,
+    name: item.name || item.accountName || "Cloudflare",
+    accountName: item.accountName || "",
+    verifiedAt: item.verifiedAt || "",
+    zoneCount: item.zoneCount ?? null,
+    maskedToken: maskToken(item.apiToken),
+  }));
+  return {
+    configured: tokens.length > 0,
+    tokenCount: tokens.length,
+    tokens,
+  };
+}
+
+async function listZonesFromAllTokens(settings) {
+  const tokens = settings?.tokens || [];
+  const zoneMap = new Map(); // zoneId -> zone+tokenId
+  for (const token of tokens) {
+    try {
+      const zones = await listCloudflareZones(token.apiToken);
+      token.zoneCount = zones.length;
+      token.verifiedAt = new Date().toISOString();
+      for (const zone of zones) {
+        if (!zoneMap.has(zone.id)) {
+          zoneMap.set(zone.id, {
+            ...zone,
+            tokenId: token.id,
+            tokenName: token.name || token.accountName || "Cloudflare",
+          });
+        }
+      }
+    } catch (error) {
+      // keep other tokens working
+      console.error(
+        JSON.stringify({
+          event: "cf_token_zones_failed",
+          tokenId: token.id,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  }
+  return Array.from(zoneMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function findTokenAndZoneForHostname(settings, hostname) {
+  const zones = await listZonesFromAllTokens(settings);
+  const zone = findZoneForHostname(hostname, zones);
+  if (!zone) return { zone: null, token: null, zones };
+  const token = (settings.tokens || []).find((item) => item.id === zone.tokenId) || null;
+  return { zone, token, zones };
 }
 
 async function cloudflareApi(apiToken, path) {
@@ -835,8 +1003,14 @@ async function listZoneCertificatePacks(apiToken, zoneId) {
       type: pack.type,
       status: pack.status,
       hosts: pack.hosts || [],
-      expires_on: pack.expires_on || null,
-      certificate_authority_expires_on: pack.certificate_authority?.expires_on || null,
+      expires_on:
+        pack.expires_on ||
+        pack.certificate_authority_expires_on ||
+        pack.certificate_authority?.expires_on ||
+        null,
+      validity_days: pack.validity_days || pack.primary_certificate?.validity_days || null,
+      // Cloudflare-managed packs are auto-renewed
+      auto_renew: pack.auto_renew !== false,
     }));
   } catch {
     // Token may lack SSL read permission; fail soft.
@@ -1330,7 +1504,18 @@ function dashboardPage(username) {
     .cf-meta{font-size:12px;color:var(--muted);margin-bottom:10px}
     .cf-status{display:inline-flex;align-items:center;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:650;background:#edf0f4;color:#697586}
     .cf-status.on{background:#e9f8d6;color:#477c00}.cf-status.err{background:#ffe3e3;color:#c92a2a}
-    .cf-zone-list{display:flex;flex-wrap:wrap;gap:8px}
+    
+    .cf-token-form{grid-template-columns:0.8fr 1.4fr;gap:12px;margin-bottom:4px}
+    .cf-token-list{display:flex;flex-direction:column;gap:8px;margin:10px 0 12px}
+    .cf-token-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
+    .cf-token-item .meta{min-width:0}
+    .cf-token-item .name{font-weight:700;font-size:13px}
+    .cf-token-item .sub{color:var(--muted);font-size:12px;margin-top:2px;word-break:break-all}
+    .cf-token-item .actions{display:flex;gap:8px;flex:0 0 auto}
+    .cert-renew-yes{color:#477c00;font-weight:650}
+    .cert-renew-no{color:#c92a2a;font-weight:650}
+    .cert-expiry-warn{color:#9c6b00;font-weight:650}
+.cf-zone-list{display:flex;flex-wrap:wrap;gap:8px}
     .zone-chip,.zone-chip-btn{border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:5px 10px;font-size:12px;color:var(--text)}
     .zone-chip-btn{cursor:pointer}.zone-chip-btn:hover{border-color:var(--blue);color:var(--blue)}
     .domain-picker{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
@@ -1425,9 +1610,10 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
               <tr>
                 <th>域名</th>
                 <th>Zone</th>
-                <th>证书状态</th>
+                <th>状态</th>
+                <th>到期时间</th>
+                <th>自动续签</th>
                 <th>SSL 模式</th>
-                <th>强制 HTTPS</th>
                 <th>回源</th>
               </tr>
             </thead>
@@ -1450,18 +1636,21 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
             <div class="cf-help-title">获取 API 令牌</div>
             <ol class="cf-help-steps">
               <li>Cloudflare 头像 → <strong>配置文件</strong> → <strong>API 令牌</strong></li>
-              <li>或打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">dash.cloudflare.com/profile/api-tokens</a></li>
-              <li><strong>创建令牌</strong>，权限至少：区域 → 区域 → 读取；可选 SSL 和证书 → 读取</li>
-              <li>不要用 Global API Key</li>
+              <li><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">dash.cloudflare.com/profile/api-tokens</a></li>
+              <li>权限：区域 → 区域 → 读取；可选 SSL 和证书 → 读取</li>
+              <li>可添加多个令牌；不要用 Global API Key</li>
             </ol>
           </div>
-          <div class="field"><label for="cfApiToken">API 令牌</label><input id="cfApiToken" type="password" autocomplete="off" placeholder="粘贴 API 令牌"></div>
-          <div class="cf-settings-actions">
-            <button type="button" class="button button-primary" id="saveCfToken">保存并验证</button>
-            <button type="button" class="button button-secondary" id="refreshCfZones">刷新域名列表</button>
-            <button type="button" class="button button-danger" id="removeCfToken">解除绑定</button>
+          <div class="grid cf-token-form">
+            <div class="field"><label for="cfTokenName">备注名</label><input id="cfTokenName" placeholder="例如 主账号 / 客户A" autocomplete="off"></div>
+            <div class="field"><label for="cfApiToken">API 令牌</label><input id="cfApiToken" type="password" autocomplete="off" placeholder="粘贴 API 令牌"></div>
           </div>
-          <div class="cf-meta" id="cfMeta">尚未绑定 Cloudflare API。</div>
+          <div class="cf-settings-actions">
+            <button type="button" class="button button-primary" id="saveCfToken">添加令牌</button>
+            <button type="button" class="button button-secondary" id="refreshCfZones">刷新域名</button>
+          </div>
+          <div class="cf-meta" id="cfMeta">未绑定</div>
+          <div class="cf-token-list" id="cfTokenList"></div>
           <div class="cf-zone-list" id="cfZoneList"></div>
         </div>
       </section>
@@ -1515,7 +1704,7 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
 
   <div class="toast" id="toast"></div>
   <script nonce="{{NONCE}}">
-    const state = { proxies: [], certificates: [], cf: { configured: false, accountName: "", zones: [], loading: false } };
+    const state = { proxies: [], certificates: [], cf: { configured: false, tokens: [], zones: [], loading: false } };
     const editor = document.getElementById("editor");
     const form = document.getElementById("proxyForm");
     const fields = Object.fromEntries([
@@ -1550,6 +1739,22 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
       return span;
     }
 
+    function formatExpiry(item) {
+      if (item.expiresOn) {
+        const date = new Date(item.expiresOn);
+        if (!Number.isNaN(date.getTime())) {
+          const dateText = date.toLocaleDateString();
+          if (item.daysLeft != null) {
+            if (item.daysLeft < 0) return dateText + "（已过期）";
+            return dateText + "（" + item.daysLeft + " 天）";
+          }
+          return dateText;
+        }
+      }
+      if (item.autoRenew) return "自动续签中";
+      return "—";
+    }
+
     function renderCertificates() {
       const rows = document.getElementById("certRows");
       const table = document.getElementById("certTableWrap");
@@ -1577,7 +1782,7 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
           badge.textContent = "未绑定 API";
           badge.className = "cf-status";
         } else {
-          badge.textContent = "Cloudflare 托管";
+          badge.textContent = (state.cf.tokens?.length || 0) + " 令牌 · 自动续签";
           badge.className = "cf-status on";
         }
       }
@@ -1598,6 +1803,7 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
       table.hidden = false;
       for (const item of list) {
         const tr = document.createElement("tr");
+
         const domain = document.createElement("td");
         const domainLink = document.createElement("a");
         domainLink.className = "domain-link";
@@ -1613,30 +1819,47 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
         const status = document.createElement("td");
         status.append(certBadge(item.status, item.statusText || item.status));
 
+        const expiry = document.createElement("td");
+        expiry.className = "cert-mono";
+        if (item.daysLeft != null && item.daysLeft <= 14 && item.daysLeft >= 0) {
+          expiry.className += " cert-expiry-warn";
+        }
+        expiry.textContent = formatExpiry(item);
+
+        const renew = document.createElement("td");
+        if (item.autoRenew === true) {
+          renew.className = "cert-renew-yes";
+          renew.textContent = "是";
+        } else if (item.autoRenew === false) {
+          renew.className = "cert-renew-no";
+          renew.textContent = "否";
+        } else {
+          renew.textContent = "—";
+        }
+
         const mode = document.createElement("td");
         mode.className = "cert-mono";
         mode.textContent = item.sslMode || "—";
-
-        const https = document.createElement("td");
-        https.textContent = item.forceHttps ? "是" : "否";
 
         const origin = document.createElement("td");
         origin.className = "cert-mono";
         origin.textContent = item.origin || "—";
 
-        tr.append(domain, zone, status, mode, https, origin);
+        tr.append(domain, zone, status, expiry, renew, mode, origin);
         rows.append(tr);
       }
     }
 
-    async function loadCertificates(silent = false) {
+async function loadCertificates(silent = false) {
       try {
         const data = await requestJson("/api/certificates");
         state.certificates = data.certificates || [];
         if (typeof data.configured === "boolean") {
           state.cf.configured = data.configured;
         }
-        if (data.accountName) state.cf.accountName = data.accountName;
+        if (data.tokenCount != null && !state.cf.tokens?.length && data.configured) {
+          // tokens details come from settings endpoint
+        }
         renderCertificates();
         updateCloudflareGate();
         if (!silent && data.error) showToast(data.error, true);
@@ -1656,34 +1879,69 @@ function showToast(message, error = false) {
     function renderCfStatus() {
       const badge = document.getElementById("cfStatusBadge");
       const meta = document.getElementById("cfMeta");
-      const list = document.getElementById("cfZoneList");
-      if (!badge || !meta || !list) return;
-      if (state.cf.configured) {
-        badge.textContent = "已绑定";
+      const tokenList = document.getElementById("cfTokenList");
+      const zoneList = document.getElementById("cfZoneList");
+      if (!badge || !meta) return;
+
+      const tokens = state.cf.tokens || [];
+      const zones = state.cf.zones || [];
+      if (tokens.length) {
+        badge.textContent = tokens.length + " 个令牌";
         badge.className = "cf-status on";
-        const parts = [];
-        if (state.cf.accountName) parts.push(state.cf.accountName);
-        parts.push((state.cf.zones?.length || 0) + " 个托管域名");
-        if (state.cf.verifiedAt) parts.push("验证于 " + new Date(state.cf.verifiedAt).toLocaleString());
-        meta.textContent = parts.join(" · ");
+        meta.textContent = zones.length + " 个托管域名";
       } else {
         badge.textContent = "未绑定";
         badge.className = "cf-status";
         meta.textContent = "未绑定";
       }
-      list.replaceChildren();
-      for (const zone of state.cf.zones || []) {
-        const chip = document.createElement("button");
-        chip.type = "button";
-        chip.className = "zone-chip-btn";
-        chip.textContent = zone.name + (zone.status && zone.status !== "active" ? (" (" + zone.status + ")") : "");
-        chip.title = "填入子域示例：api." + zone.name;
-        chip.addEventListener("click", () => {
-          fields.domain.value = "api." + zone.name;
-          fields.domain.focus();
-          selectTab("details");
-        });
-        list.append(chip);
+
+      if (tokenList) {
+        tokenList.replaceChildren();
+        for (const token of tokens) {
+          const row = document.createElement("div");
+          row.className = "cf-token-item";
+          const metaBox = document.createElement("div");
+          metaBox.className = "meta";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = token.name || token.accountName || "Cloudflare";
+          const sub = document.createElement("div");
+          sub.className = "sub";
+          const parts = [];
+          if (token.accountName) parts.push(token.accountName);
+          if (token.maskedToken) parts.push(token.maskedToken);
+          if (token.zoneCount != null) parts.push(token.zoneCount + " 域名");
+          sub.textContent = parts.join(" · ") || token.id;
+          metaBox.append(name, sub);
+          const actions = document.createElement("div");
+          actions.className = "actions";
+          const del = document.createElement("button");
+          del.type = "button";
+          del.className = "button button-danger button-sm";
+          del.textContent = "删除";
+          del.addEventListener("click", () => removeCloudflareToken(token.id));
+          actions.append(del);
+          row.append(metaBox, actions);
+          tokenList.append(row);
+        }
+      }
+
+      if (zoneList) {
+        zoneList.replaceChildren();
+        for (const zone of zones) {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "zone-chip-btn";
+          chip.textContent = zone.name + (zone.tokenName ? " · " + zone.tokenName : "");
+          chip.title = "填入 api." + zone.name;
+          chip.addEventListener("click", () => {
+            fields.domain.value = "api." + zone.name;
+            fields.domain.focus();
+            navigateTo("proxies");
+            openEditor();
+          });
+          zoneList.append(chip);
+        }
       }
     }
 
@@ -1729,9 +1987,7 @@ function showToast(message, error = false) {
       try {
         const data = await requestJson("/api/settings/cloudflare");
         state.cf.configured = Boolean(data.configured);
-        state.cf.accountName = data.accountName || "";
-        state.cf.verifiedAt = data.verifiedAt || "";
-        state.cf.zoneCount = data.zoneCount;
+        state.cf.tokens = data.tokens || [];
         renderCfStatus();
         if (data.configured) {
           await loadCloudflareZones(true);
@@ -1742,7 +1998,6 @@ function showToast(message, error = false) {
           updateCloudflareGate();
         }
       } catch (error) {
-        // ignore on first paint
         renderCfStatus();
       }
     }
@@ -1753,20 +2008,22 @@ function showToast(message, error = false) {
       try {
         const data = await requestJson("/api/cloudflare/zones");
         state.cf.configured = true;
-        state.cf.accountName = data.accountName || state.cf.accountName || "";
         state.cf.zones = data.zones || [];
-        state.cf.zoneCount = state.cf.zones.length;
-        state.cf.verifiedAt = new Date().toISOString();
+        if (data.tokenCount != null) {
+          // keep tokens list; zone refresh shouldn't wipe it
+        }
         renderCfStatus();
         renderDomainSuggestions();
         updateCloudflareGate();
         if (!silent) showToast("已刷新 " + state.cf.zones.length + " 个域名");
       } catch (error) {
-        if (String(error.message || "").includes("尚未绑定")) {
+        if (String(error.message || "").includes("未绑定")) {
           state.cf.configured = false;
           state.cf.zones = [];
+          state.cf.tokens = [];
           renderCfStatus();
           renderDomainSuggestions();
+          updateCloudflareGate();
         }
         if (!silent) showToast(error.message, true);
       } finally {
@@ -1776,47 +2033,60 @@ function showToast(message, error = false) {
 
     async function saveCloudflareToken() {
       const apiToken = document.getElementById("cfApiToken").value.trim();
+      const name = (document.getElementById("cfTokenName")?.value || "").trim();
       if (!apiToken) {
-        showToast("请先粘贴 API Token", true);
+        showToast("请先粘贴 API 令牌", true);
         return;
       }
       try {
         const data = await requestJson("/api/settings/cloudflare", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ apiToken }),
+          body: JSON.stringify({ apiToken, name }),
         });
         document.getElementById("cfApiToken").value = "";
-        state.cf.configured = true;
-        state.cf.accountName = data.accountName || "";
-        state.cf.verifiedAt = data.verifiedAt || "";
+        if (document.getElementById("cfTokenName")) document.getElementById("cfTokenName").value = "";
+        state.cf.configured = Boolean(data.configured);
+        state.cf.tokens = data.tokens || [];
         state.cf.zones = data.zones || [];
-        state.cf.zoneCount = state.cf.zones.length;
         renderCfStatus();
         renderDomainSuggestions();
         updateCloudflareGate();
-        showToast("已绑定 " + state.cf.zones.length + " 个域名");
+        showToast("已添加，共 " + (state.cf.tokens.length || 0) + " 个令牌");
       } catch (error) {
         showToast(error.message, true);
       }
     }
 
-    async function removeCloudflareToken() {
-      if (!confirm("确定解除 Cloudflare API 绑定？")) return;
+    async function removeCloudflareToken(tokenId) {
+      if (!tokenId) {
+        if (!confirm("确定删除全部 API 令牌？")) return;
+      } else if (!confirm("确定删除该 API 令牌？")) {
+        return;
+      }
       try {
-        await requestJson("/api/settings/cloudflare", { method: "DELETE" });
-        state.cf = { configured: false, accountName: "", zones: [], loading: false };
-        document.getElementById("cfApiToken").value = "";
+        const data = await requestJson(
+          "/api/settings/cloudflare" + (tokenId ? ("?id=" + encodeURIComponent(tokenId)) : ""),
+          { method: "DELETE" },
+        );
+        state.cf.configured = Boolean(data.configured);
+        state.cf.tokens = data.tokens || [];
+        if (!state.cf.configured) {
+          state.cf.zones = [];
+        } else {
+          await loadCloudflareZones(true);
+        }
         renderCfStatus();
         renderDomainSuggestions();
         updateCloudflareGate();
-        showToast("已解除绑定");
+        showToast(state.cf.configured ? "令牌已删除" : "已解除全部绑定");
       } catch (error) {
         showToast(error.message, true);
       }
     }
 
-async function requestJson(path, options = {}) {
+
+    async function requestJson(path, options = {}) {
       const response = await fetch(path, options);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "请求失败 (" + response.status + ")");
@@ -1829,32 +2099,38 @@ async function requestJson(path, options = {}) {
     }
 
     function showView(name) {
-      document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.dataset.view === name));
-      document.querySelectorAll("[data-view-link]").forEach(link => {
-        const active = link.dataset.viewLink === name;
-        link.classList.toggle("active", active);
+      document.querySelectorAll(".view").forEach((view) =>
+        view.classList.toggle("active", view.dataset.view === name),
+      );
+      document.querySelectorAll("[data-view-link]").forEach((link) => {
+        link.classList.toggle("active", link.dataset.viewLink === name);
       });
-      document.querySelectorAll(".account-menu[open]").forEach(menu => menu.removeAttribute("open"));
+      document.querySelectorAll(".account-menu[open]").forEach((menu) => menu.removeAttribute("open"));
       if (name === "certificates") loadCertificates(true);
     }
 
     function navigateTo(name) {
-      const target = ["dashboard", "proxies", "certificates", "settings"].includes(name) ? name : "dashboard";
+      const target = ["dashboard", "proxies", "certificates", "settings"].includes(name)
+        ? name
+        : "dashboard";
       const current = location.hash.replace(/^#/, "") || "dashboard";
-      if (current !== target) {
-        location.hash = target;
-      }
+      if (current !== target) location.hash = target;
       showView(target);
     }
 
     function setTheme(theme) {
       document.documentElement.dataset.theme = theme;
-      document.getElementById("themeToggle").setAttribute("aria-label", theme === "dark" ? "切换浅色模式" : "切换深色模式");
+      const toggle = document.getElementById("themeToggle");
+      if (toggle) {
+        toggle.setAttribute("aria-label", theme === "dark" ? "切换浅色模式" : "切换深色模式");
+      }
       localStorage.setItem("edge-proxy-theme", theme);
     }
 
     function formatLocations(config) {
-      return (config.locations || []).map(item => item.path + " = " + item.origin).join("\\n");
+      return (config.locations || [])
+        .map((item) => item.path + " = " + item.origin)
+        .join("\\n");
     }
 
     function closeEditor() {
@@ -1862,7 +2138,15 @@ async function requestJson(path, options = {}) {
       else editor.removeAttribute("open");
     }
 
-    
+    function requireCloudflareBound(actionLabel = "操作") {
+      if (!state.cf.configured) {
+        showToast("请先绑定 Cloudflare API", true);
+        navigateTo("settings");
+        return false;
+      }
+      return true;
+    }
+
     function normalizeLandingHash(hash) {
       if (!hash) return "";
       return hash.startsWith("#") ? hash.slice(1) : hash;
@@ -1876,7 +2160,7 @@ async function requestJson(path, options = {}) {
       }
       let parsed;
       try {
-        parsed = new URL(value.includes("://") ? value : ("http://" + value));
+        parsed = new URL(value.includes("://") ? value : "http://" + value);
       } catch {
         if (!options.silent) showToast("链接格式无效", true);
         return null;
@@ -1895,7 +2179,8 @@ async function requestJson(path, options = {}) {
       fields.targetPort.value = port;
       fields.landingPath.value = landingPath;
       fields.landingHash.value = landingHash;
-      fields.originUrl.value = parsed.origin + (landingPath || "") + (parsed.search || "") + (parsed.hash || "");
+      fields.originUrl.value =
+        parsed.origin + (landingPath || "") + (parsed.search || "") + (parsed.hash || "");
       if (!options.silent) {
         const parts = [scheme.toUpperCase(), parsed.hostname + ":" + port];
         if (landingPath) parts.push(landingPath);
@@ -1905,16 +2190,7 @@ async function requestJson(path, options = {}) {
       return true;
     }
 
-function requireCloudflareBound(actionLabel = "操作") {
-      if (!state.cf.configured) {
-        showToast("请先绑定 Cloudflare API", true);
-        navigateTo("settings");
-        return false;
-      }
-      return true;
-    }
-
-    function openEditor(config = null) {
+function openEditor(config = null) {
       if (!requireCloudflareBound(config ? "编辑代理映射" : "添加代理映射")) return;
       form.reset();
       fields.originUrl.value = "";
