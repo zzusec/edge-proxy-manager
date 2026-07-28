@@ -139,6 +139,17 @@ async function handleAdminRequest(request, env, url) {
           400,
         );
       }
+
+      // Auto-bind domain to Worker
+      const token = cfSettings.tokens.find(t => t.id === matchedZone.tokenId);
+      if (token) {
+        try {
+          await ensureWorkerRoute(token.apiToken, matchedZone.id, domain, matchedZone.name, "edge-proxy-manager");
+        } catch (routeError) {
+          console.error("Failed to bind domain:", routeError);
+          // Continue anyway - user can manually bind
+        }
+      }
     } catch (error) {
       return jsonResponse(
         {
@@ -652,6 +663,15 @@ async function handleProxyRequest(request, env, incomingUrl) {
     headers.set("Referer", referer.replace(incomingUrl.origin, targetOrigin));
   }
 
+  // 添加自定义请求头
+  if (Array.isArray(config.customHeaders)) {
+    for (const { name, value } of config.customHeaders) {
+      if (name && value) {
+        headers.set(name, value);
+      }
+    }
+  }
+
   const requestInit = {
     method: request.method,
     headers,
@@ -1047,6 +1067,133 @@ async function listCloudflareDnsRecords(apiToken, zoneId) {
   return records;
 }
 
+async function ensureWorkerRoute(apiToken, zoneId, hostname, zoneName, workerName) {
+  // Check if DNS record exists
+  const records = await listCloudflareDnsRecords(apiToken, zoneId);
+  const existingRecord = records.find(r => r.name === hostname);
+
+  // Get subdomain part (e.g., "api" from "api.hx10.com")
+  const subdomain = hostname.replace(`.${zoneName}`, "") || "@";
+
+  if (!existingRecord) {
+    // Create DNS record pointing to Worker (placeholder IP, proxied)
+    await cloudflareApiPost(
+      apiToken,
+      `/zones/${encodeURIComponent(zoneId)}/dns_records`,
+      {
+        type: "A",
+        name: subdomain,
+        content: "192.0.2.1",
+        proxied: true,
+        comment: "Edge Proxy Manager auto-created",
+        ttl: 1,
+      },
+    );
+  } else if (!existingRecord.proxied) {
+    // Enable proxying if not already
+    await cloudflareApiPatch(
+      apiToken,
+      `/zones/${encodeURIComponent(zoneId)}/dns_records/${existingRecord.id}`,
+      { proxied: true },
+    );
+  }
+
+  // Add worker route
+  try {
+    await cloudflareApiPost(
+      apiToken,
+      `/zones/${encodeURIComponent(zoneId)}/workers/routes`,
+      { pattern: `${hostname}/*`, script: workerName },
+    );
+  } catch (e) {
+    // Route may already exist, ignore
+  }
+}
+
+async function cloudflareApiPost(apiToken, path, body) {
+  const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`Cloudflare API 返回异常 (${response.status})`);
+  }
+
+  if (!response.ok || payload?.success === false) {
+    const msg =
+      payload?.errors?.[0]?.message ||
+      payload?.messages?.[0] ||
+      `Cloudflare API 错误 (${response.status})`;
+    throw new Error(msg);
+  }
+
+  return payload;
+}
+
+async function cloudflareApiPatch(apiToken, path, body) {
+  const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`Cloudflare API 返回异常 (${response.status})`);
+  }
+
+  if (!response.ok || payload?.success === false) {
+    const msg =
+      payload?.errors?.[0]?.message ||
+      payload?.messages?.[0] ||
+      `Cloudflare API 错误 (${response.status})`;
+    throw new Error(msg);
+  }
+
+  return payload;
+}
+
+async function cloudflareApiWithBody(apiToken, path, method, body) {
+  const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`Cloudflare API 返回异常 (${response.status})`);
+  }
+
+  if (!response.ok || payload?.success === false) {
+    const msg =
+      payload?.errors?.[0]?.message ||
+      payload?.messages?.[0] ||
+      `Cloudflare API 错误 (${response.status})`;
+    throw new Error(msg);
+  }
+
+  return payload;
+}
+
 async function listProxyConfigs(kv) {
   const proxies = [];
   let cursor;
@@ -1107,6 +1254,9 @@ function validateProxyConfig(input) {
     return { error: locationResult.error };
   }
 
+  // 处理自定义请求头
+  const customHeaders = parseCustomHeaders(input.customHeadersText);
+
   return {
     config: {
       domain,
@@ -1116,6 +1266,7 @@ function validateProxyConfig(input) {
       landingPath,
       landingHash,
       locations: locationResult.locations,
+      customHeaders,
       enabled: input.enabled !== false,
       websocket: input.websocket === true,
       forceHttps: input.forceHttps === true,
@@ -1172,6 +1323,30 @@ function parseLocations(value) {
 
   locations.sort((left, right) => right.path.length - left.path.length);
   return { locations };
+}
+
+function parseCustomHeaders(value) {
+  const lines = String(value || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const headers = [];
+
+  for (const line of lines) {
+    const separator = line.indexOf(":");
+    if (separator < 1) {
+      continue; // 跳过无效行
+    }
+
+    const name = line.slice(0, separator).trim();
+    const headerValue = line.slice(separator + 1).trim();
+
+    if (name && headerValue) {
+      headers.push({ name, value: headerValue });
+    }
+  }
+
+  return headers;
 }
 
 function createTargetOrigin(scheme, host, port) {
@@ -1679,7 +1854,7 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
             <ol class="cf-help-steps">
               <li>Cloudflare 头像 → <strong>配置文件</strong> → <strong>API 令牌</strong></li>
               <li><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">dash.cloudflare.com/profile/api-tokens</a></li>
-              <li>权限：区域 → 区域 → 读取；可选 SSL 和证书 → 读取</li>
+              <li>权限：区域 → 区域 → 读取；区域 → DNS → 编辑；区域 → Workers Routes → 编辑</li>
               <li>可添加多个令牌；不要用 Global API Key</li>
             </ol>
           </div>
@@ -1741,6 +1916,11 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
                 <div class="field"><label for="landingPath">默认入口路径</label><input id="landingPath" placeholder="/management.html"></div>
                 <div class="field"><label for="landingHash">入口 Hash</label><input id="landingHash" placeholder="/"></div>
               </div>
+              <div class="field" style="margin-top:12px">
+                <label for="customHeadersText">自定义请求头</label>
+                <textarea id="customHeadersText" placeholder="Authorization: Basic YWRtaW46cGFzc3dvcmQK&#10;X-Custom-Header: value" style="min-height:80px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px"></textarea>
+                <div class="hint">每行一个请求头，格式：Header-Name: value</div>
+              </div>
               <div class="switches compact-switches">
                 <label class="switch"><span>启用代理</span><input id="enabled" type="checkbox" checked></label>
                 <label class="switch"><span>WebSocket</span><input id="websocket" type="checkbox"></label>
@@ -1786,7 +1966,7 @@ dialog{width:min(760px,calc(100% - 24px));max-height:calc(100vh - 28px);border:0
     const editor = document.getElementById("editor");
     const form = document.getElementById("proxyForm");
     const fields = Object.fromEntries([
-      "originalDomain","originUrl","domain","scheme","targetHost","targetPort","landingPath","landingHash","locationsText","enabled","websocket","blockExploits","forceHttps","hsts"
+      "originalDomain","originUrl","domain","scheme","targetHost","targetPort","landingPath","landingHash","locationsText","customHeadersText","enabled","websocket","blockExploits","forceHttps","hsts"
     ].map(id => [id, document.getElementById(id)]));
 
     
@@ -2211,6 +2391,12 @@ function showToast(message, error = false) {
         .join("\\n");
     }
 
+    function formatCustomHeaders(headers) {
+      return (headers || [])
+        .map((item) => item.name + ": " + item.value)
+        .join("\\n");
+    }
+
     function closeEditor() {
       if (typeof editor.close === "function") editor.close();
       else editor.removeAttribute("open");
@@ -2291,6 +2477,7 @@ function openEditor(config = null) {
         fields.originUrl.value = (config.scheme || "http") + "://" + config.targetHost + ":" + port + path + hash;
       }
       fields.locationsText.value = config ? formatLocations(config) : "";
+      fields.customHeadersText.value = config?.customHeaders ? formatCustomHeaders(config.customHeaders) : "";
       fields.enabled.checked = config ? config.enabled : true;
       fields.websocket.checked = config?.websocket || false;
       fields.blockExploits.checked = config ? config.blockExploits : true;
@@ -2347,9 +2534,14 @@ function openEditor(config = null) {
         domain.rel = "noopener noreferrer";
         domain.textContent = "https://" + config.domain;
         domain.title = "在新窗口打开 https://" + config.domain;
-        const target = document.createElement("span");
-        target.className = "recent-target";
-        target.textContent = config.scheme + "://" + config.targetHost + ":" + config.targetPort;
+        const target = document.createElement("a");
+        const targetUrl = config.scheme + "://" + config.targetHost + ":" + config.targetPort;
+        target.className = "recent-target domain-link";
+        target.href = targetUrl;
+        target.target = "_blank";
+        target.rel = "noopener noreferrer";
+        target.textContent = targetUrl;
+        target.title = "在新窗口打开 " + targetUrl;
         row.append(domain, target, createStatusBadge(config.enabled));
         recent.append(row);
       }
@@ -2400,7 +2592,15 @@ function openEditor(config = null) {
         domain.append(domainWrap);
         const target = document.createElement("td");
         target.className = "target";
-        target.textContent = config.scheme + "://" + config.targetHost + ":" + config.targetPort;
+        const targetUrl = config.scheme + "://" + config.targetHost + ":" + config.targetPort;
+        const targetLink = document.createElement("a");
+        targetLink.className = "domain-link";
+        targetLink.href = targetUrl;
+        targetLink.target = "_blank";
+        targetLink.rel = "noopener noreferrer";
+        targetLink.textContent = targetUrl;
+        targetLink.title = "在新窗口打开 " + targetUrl;
+        target.append(targetLink);
         const status = document.createElement("td");
         status.append(createStatusBadge(config.enabled));
         const websocket = document.createElement("td");
@@ -2562,6 +2762,7 @@ function openEditor(config = null) {
         landingPath: fields.landingPath.value,
         landingHash: fields.landingHash.value,
         locationsText: fields.locationsText.value,
+        customHeadersText: fields.customHeadersText.value,
         enabled: fields.enabled.checked,
         websocket: fields.websocket.checked,
         blockExploits: fields.blockExploits.checked,
